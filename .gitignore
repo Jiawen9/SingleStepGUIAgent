@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.py[cod]
+screenshots/
+device_captures/
+*.egg-info/
+build/
+dist/
+.pytest_cache/

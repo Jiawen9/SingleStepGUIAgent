@@ -1,0 +1,8 @@
+# Pillow encodes screenshots after Qwen-compatible resizing.
+Pillow>=10.0
+# Official Qwen image preprocessing preserves aspect ratio and token limits.
+qwen-vl-utils>=0.0.14
+# Use a project-controlled CA bundle for HTTPS model requests.
+certifi>=2024.2.2
+# Existing iQIYI atomic tools require uiautomator2.
+uiautomator2>=3.0

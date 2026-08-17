@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SingleStepGUIAgent"
+version = "0.1.0"
+description = "An extensible input, action-engine, command, and execution pipeline for Android GUI automation."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "Pillow>=10.0",
+  "qwen-vl-utils>=0.0.14",
+  "certifi>=2024.2.2",
+  "uiautomator2>=3.0",
+]
+
+[project.scripts]
+single-step-gui-agent = "orchestrator:main"
+
+[tool.setuptools]
+packages = [
+  "input",
+  "engines",
+  "engines.xml",
+  "engines.vla",
+  "engines.vla.prompts",
+  "output",
+  "execution",
+  "execution.atomic_tools",
+  "execution.atomic_tools.iqiyi",
+  "device",
+  "storage",
+]
+py-modules = ["orchestrator", "contracts", "config", "gui_agent_ttk"]
