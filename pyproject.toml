@@ -12,6 +12,8 @@ dependencies = [
   "Pillow>=10.0",
   "qwen-vl-utils>=0.0.14",
   "certifi>=2024.2.2",
+  "requests>=2.31",
+  "openpyxl>=3.1",
   "uiautomator2>=3.0",
 ]
 
@@ -23,6 +25,7 @@ packages = [
   "input",
   "engines",
   "engines.xml",
+  "engines.ocr",
   "engines.vla",
   "engines.vla.prompts",
   "output",
@@ -32,4 +35,4 @@ packages = [
   "device",
   "storage",
 ]
-py-modules = ["orchestrator", "contracts", "config", "gui_agent_ttk"]
+py-modules = ["orchestrator", "evaluator", "annotation_tool_ttk", "contracts", "config", "gui_agent_ttk"]

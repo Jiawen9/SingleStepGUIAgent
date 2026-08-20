@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from xml.etree import ElementTree
 
 from contracts import ActionSelection
-from .instruction import ClickIntent, parse_click_instruction
+from engines.instruction import ClickIntent, parse_click_instruction
 from .matcher import ClickTarget, resolve_click_match
 
 

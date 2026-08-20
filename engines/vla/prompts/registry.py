@@ -20,6 +20,10 @@ _PACKAGE_MODULES = {
     "com.qiyi.video": ".iqiyi",
     "com.qiyi.video.pad": ".iqiyi",
     "com.qiyi.video.speaker": ".iqiyi",
+    "com.netease.cloudmusic.iot": ".netease_cloudmusic",
+    "com.ximalayaos.pad": ".ximalaya",
+    "com.ss.android.ugc.aweme": ".douyin",
+    "com.tencent.qqlive.audiobox": ".tencent_video",
 }
 
 

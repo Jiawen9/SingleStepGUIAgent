@@ -5,10 +5,10 @@ SingleStepGUIAgent 是一个 Android 单步 GUI Agent：采集一次设备状态
 默认执行流程：
 
 ```text
-输入采集 → XML 指令前处理 → XML 引擎 → VLA 引擎 → 命令转换 → 设备执行 → 结果留档
+输入采集 → 点击指令前处理 → UITree/XML 引擎 → OCR 引擎 → VLA 引擎 → 命令转换 → 设备执行 → 结果留档
 ```
 
-XML 引擎未命中时才调用 VLA。截图和第一次 XML dump 在同一次任务中只采集一次，并由两个引擎共享。
+默认决策顺序为 `UITree/XML → OCR → VLA`。截图和第一次 XML dump 在同一次任务中只采集一次。OCR 与 UITree 共用点击指令解析；UITree 未命中后，OCR 会在原始截图的识别文本中精确匹配目标，达到置信度阈值时点击文本框中心，否则继续使用 VLA。
 
 VLA 截图通过 Qwen 官方 `qwen-vl-utils` 等比例处理，最多使用 1024 个视觉 token。模型输出的 `0～1000` 千分位坐标会直接映射回原始截图尺寸。
 
@@ -36,6 +36,32 @@ DEVICE_ID=your-device-serial
 ADB_PATH=D:\platform-tools\adb.exe
 ```
 
+OCR 支持 PaddleOCR AI Studio 云端异步 API 和本地 PaddleOCR/PaddleX 服务。云端模式配置：
+
+```dotenv
+OCR_PROVIDER=cloud
+OCR_CLOUD_JOB_URL=https://paddleocr.aistudio-app.com/api/v2/ocr/jobs
+OCR_CLOUD_TOKEN=your-new-token
+OCR_MIN_SCORE=0.5
+OCR_DIAGNOSTIC_TOP_N=3
+OCR_TIMEOUT_SECONDS=120
+OCR_POLL_INTERVAL_SECONDS=5
+OCR_CONNECTION_RETRIES=3
+OCR_RETRY_BACKOFF_SECONDS=2
+```
+
+本地模式只需服务地址，服务端需预先加载 `PP-OCRv6_medium`：
+
+```dotenv
+OCR_PROVIDER=local
+OCR_LOCAL_URL=http://127.0.0.1:8080/predict
+OCR_MIN_SCORE=0.5
+OCR_DIAGNOSTIC_TOP_N=3
+OCR_TIMEOUT_SECONDS=120
+```
+
+云端 Token 只写入被 Git 忽略的 `.env`，不要提交到仓库。
+
 也可以安装为标准 Python 工程：
 
 ```powershell
@@ -60,11 +86,53 @@ python -m orchestrator "IQY_001" "暂停视频" --dry-run
 python -m orchestrator "IQY_001" "点击搜索" --serial HA223YB6
 
 # 指定引擎顺序；--engine 可以重复
-python -m orchestrator "IQY_001" "点击搜索" --engine xml --engine vla
+python -m orchestrator "IQY_001" "点击搜索" --engine xml --engine ocr --engine vla
 
 # 查看完整参数
 python -m orchestrator --help
 ```
+
+## Excel 批量评测
+
+任务表的工作表名为 `测试用例集`，使用 `任务指令`、`图片ID`、`UI-TREE`、`二级能力`、`三级能力`、`结果输出` 六列。
+评测只读取静态截图和 XML，不操作设备：
+
+```powershell
+python evaluator.py test.xlsx --mode xml-ocr
+python evaluator.py test.xlsx --mode vla-basic
+python evaluator.py test.xlsx --mode vla-combo --workers 4
+python evaluator.py test.xlsx --mode xml-ocr-vla --workers 4
+```
+
+`vla-basic` 只开放基础动作；`vla-combo` 根据 UI-TREE 中识别到的前台 App 加载对应组合动作。`xml-ocr-vla` 的最后一级 VLA 同样开启组合动作，`xml-ocr` 不调用 VLA。
+
+多引擎模式在每条用例内按顺序串行回退：`xml-ocr` 使用 `XML → OCR`，`xml-ocr-vla` 使用 `XML → OCR → VLA`。当前引擎只要选出动作即停止，不命中或发生可恢复错误时才进入下一个引擎；最终只按选中动作判分，不再执行全部引擎后取正确结果并集。`--workers` 仅控制不同 Excel 用例行之间的并发。
+
+总览按测试集能力列固定汇总为：`文本-清晰`（文本定位 + 意图清晰）、`文本-模糊`（文本定位 + 意图模糊）、`图标-清晰`（图标定位 + 意图清晰）、`图标-模糊`（图标定位 + 意图模糊）、`拒答`（二级能力为拒答）和`总体`。结果以串行回退链最终选中的动作为准。
+
+评测默认使用单线程；通过 `--workers N` 可按用例行并发执行。VLA/OCR 服务可能有限流，建议从 `--workers 4` 开始调整。
+运行过程中会实时输出每条用例的 `START` 和 `PASS`/`FAIL`/`ERROR` 状态、完成进度与耗时；输出使用即时刷新，适合在远程终端观察。
+单个模型响应无法解析或某个引擎抛出普通异常时，该错误只记录到当前引擎和用例，批量评测会继续执行其他引擎及后续用例；手动中断仍会正常停止程序。
+
+评测结束后，可使用根目录的 TTK 人工检查工具打开结果报告：
+
+```powershell
+python evaluation_report_ttk.py test_result_20260819-120000.xlsx
+```
+
+工具左侧显示截图，并以红色叠加标准结果、蓝色叠加模型像素动作；右侧列出每条单步指令、标准结果、模型结果和判定状态。报告应与 `device_captures` 目录位于同一级目录。
+
+结果默认保存为 `test_result_<时间戳>.xlsx`，包含原任务表、评测明细和总览。
+
+参考答案可使用 TTK 标注工具逐行编辑，翻页和关闭时自动保存：
+
+```powershell
+python annotation_tool_ttk.py test.xlsx
+```
+
+标注工具从工程根目录的 `device_captures` 读取图片和 UI-TREE；例如图片ID
+`IQY_001` 对应 `device_captures/IQY_001.png`，UI-TREE 可填写
+`IQY_001_0.xml`。绝对路径仍可直接使用。
 
 ## 动作协议
 
@@ -94,6 +162,48 @@ VLA 只返回一个扁平 JSON 动作，不使用 API function calling。
 {"action_id":"reject","reason_type":"拒绝类型"}
 ```
 
+网易云音乐包名 `com.netease.cloudmusic.iot` 会额外加载搜索动作协议：
+
+```json
+{"action":"player_search","query":"搜索词"}
+```
+
+当前仅提供 Prompt、动作目录和参数校验，尚未实现对应组合工具，不能在设备执行阶段运行该动作。
+
+喜马拉雅包名 `com.ximalayaos.pad` 会加载以下动作协议：
+
+```json
+{"action":"player_search","query":"搜索词"}
+{"action":"player_set_playback_speed","speed":"1.5x"}
+{"action":"player_set_sleep_timer","minutes":30}
+```
+
+允许的倍速为 `0.5x`、`1.0x`、`1.5x`、`2.0x`、`2.5x`、`3.0x`；定时暂停分钟数为 `15`、`30`、`60`、`90`。当前同样只提供 Prompt、动作目录和参数校验，尚未实现组合工具。
+
+抖音包名 `com.ss.android.ugc.aweme` 会加载以下动作协议：
+
+```json
+{"action":"player_search","query":"搜索词"}
+{"action":"player_set_playback_speed","speed":"1.25x"}
+{"action":"player_pause"}
+{"action":"player_next_episode"}
+```
+
+允许的倍速为 `0.5x`、`1.0x`（正常）、`1.25x`、`1.5x`。当前只提供 Prompt、动作目录和参数校验，尚未实现组合工具。
+
+腾讯视频包名 `com.tencent.qqlive.audiobox` 会加载以下动作协议：
+
+```json
+{"action":"player_search","query":"搜索词"}
+{"action":"player_set_playback_speed","speed":"1.25x"}
+{"action":"player_pause"}
+{"action":"player_resume"}
+{"action":"player_previous_episode"}
+{"action":"player_next_episode"}
+```
+
+允许的倍速为 `0.5x`、`0.75x`、`1.0x`、`1.25x`、`1.5x`。当前只提供 Prompt、动作目录和参数校验，尚未实现组合工具。
+
 `reason_type` 只允许：
 
 - `TARGET_NOT_VISIBLE`：目标或执行动作所需的状态不可见。
@@ -109,6 +219,7 @@ VLA 只返回一个扁平 JSON 动作，不使用 API function calling。
 - `<case_id>_0.xml`：首次 UI XML。
 - `<case_id>_done.png`：执行后的截图。
 - `<case_id>_draw.png`：动作标注图。
+- `<case_id>_ocr.png`：OCR 全部识别文本框、文字和置信度标注图。
 - `prompt.txt`：实际发送给 VLA 的文本 Prompt。
 - `result.json`：输入、各引擎结果、选中动作、执行命令、执行结果和耗时。
 - `<case_id>_1.xml`、`<case_id>_2.xml` 等：原子工具执行期间产生的后续 XML。
@@ -118,6 +229,9 @@ VLA 只返回一个扁平 JSON 动作，不使用 API function calling。
 ```text
 SingleStepGUIAgent/
 ├─ orchestrator.py                         # Pipeline 总编排、参数解析和命令行入口
+├─ evaluator.py                            # Excel 静态任务批量评测、判分和汇总
+├─ evaluation_report_ttk.py                # 评测报告红蓝动作叠加人工检查工具
+├─ annotation_tool_ttk.py                  # Excel 用例参考答案可视化标注工具
 ├─ contracts.py                            # 输入、动作、命令、执行结果等共享数据契约
 ├─ config.py                               # 环境变量读取和 AgentConfig
 ├─ gui_agent_ttk.py                        # TTK 图形界面和 scrcpy 预览
@@ -129,13 +243,17 @@ SingleStepGUIAgent/
 │  ├─ base.py                              # Engine 统一接口
 │  ├─ registry.py                          # 按配置顺序装配引擎链
 │  ├─ validation.py                        # 动作规格、规范化和参数校验
+│  ├─ instruction.py                       # UITree 与 OCR 共用的点击指令解析
+│  ├─ preprocessing.py                     # 共用前处理器及调度
 │  ├─ xml/
 │  │  ├─ __init__.py                      # XML 引擎公开接口
 │  │  ├─ engine.py                        # XML 确定性决策引擎
-│  │  ├─ preprocessor.py                  # XML 指令前处理器及调度
-│  │  ├─ instruction.py                   # 点击指令识别和目标词提取
 │  │  ├─ matcher.py                       # 指令目标与 UI 节点匹配
 │  │  └─ router.py                        # XML 点击规则路由和动作生成
+│  ├─ ocr/
+│  │  ├─ __init__.py                      # OCR 引擎公开接口
+│  │  ├─ client.py                        # 云端异步与本地同步 PaddleOCR 客户端
+│  │  └─ engine.py                        # OCR 文本匹配、阈值与点击动作生成
 │  └─ vla/
 │     ├─ __init__.py                      # VLA 引擎公开接口
 │     ├─ engine.py                        # VLA 决策引擎适配

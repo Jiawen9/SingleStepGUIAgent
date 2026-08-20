@@ -57,6 +57,7 @@ class EngineContext:
 
     execution_input: ExecutionInput
     prepared: dict[str, Any] = field(default_factory=dict)
+    runtime: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -103,7 +104,7 @@ class ExecutionCommand:
     action: ActionSelection
 
     def __post_init__(self) -> None:
-        if self.kind not in {"adb", "atomic_tool", "reject"}:
+        if self.kind not in {"adb", "atomic_tool", "reject", "evaluation"}:
             raise ValueError(f"Invalid execution command kind: {self.kind}")
 
     def as_dict(self) -> dict[str, Any]:
@@ -128,3 +129,13 @@ class PipelineResult:
     execution: ExecutionResult | None
     timings_seconds: dict[str, float]
     result_path: Path
+
+
+@dataclass(frozen=True)
+class DecisionOutcome:
+    """Pure decision output shared by normal runs and offline evaluation."""
+
+    engine_results: tuple[EngineResult, ...]
+    selected_engine_result: EngineResult | None
+    command: ExecutionCommand | None
+    timings_seconds: dict[str, float]

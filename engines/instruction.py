@@ -1,4 +1,4 @@
-"""Preprocess the narrow click intent supported by the UITree fast path."""
+"""Parse the shared click intent used by deterministic GUI engines."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ class ClickIntent:
 # These are interaction words, not target words. They may occur after polite
 # prefixes ("请帮我") or after the target ("爱奇艺点开").
 _CLICK_VERB = re.compile(
-    r"点击一下|点按一下|点一下|按一下|点开|选中|选择|点击|点按|按下|"
-    r"打开|进入|按(?!钮)|点"
+    r"点击一下|点按一下|点一下|按一下|点开|选中|选择|选集|点击|点按|按下|"
+    r"打开|进入|查看|浏览|播放|收听|搜索|筛选|预约|使用|退出|取消|关注|回关|"
+    r"继续|进行|设置|看|按(?!钮)|点"
 )
 _LEADING_FILLERS = re.compile(
     r"^(?:(?:请|麻烦|拜托|帮我|帮忙|给我|替我|在页面上|在页面中|"
@@ -58,6 +59,7 @@ _WRAPPING_QUOTES = {
     ('"', '"'),
     ("'", "'"),
 }
+_DIRECT_VISIBLE_TARGETS = frozenset({"立即续费", "10分钟新闻早餐"})
 
 
 def clean_ui_text(value: str) -> str:
@@ -157,11 +159,29 @@ def parse_click_instruction(instruction: str) -> ClickIntent | None:
     if _COMPOUND_MARKERS.search(source):
         return None
     matches = list(_CLICK_VERB.finditer(source))
-    if len(matches) != 1:
+    if not matches:
+        if source in _DIRECT_VISIBLE_TARGETS:
+            return ClickIntent(source, source, (source,))
         return None
+    if len(matches) > 1:
+        between = source[matches[0].end() : matches[1].start()]
+        if "后" in between:
+            return None
+    # A visible label may itself contain another interaction word, such as
+    # “点击全部播放” or “点击关注”. Only the first verb describes the requested
+    # interaction; the remaining words belong to the target label.
     candidates = _extract_target_candidates(source, matches[0])
     if not candidates:
+        # Standalone action labels such as “取消” and colloquial “筛选一下”
+        # still refer to the visible control named by the verb itself.
+        candidates = _candidate_variants(matches[0].group())
+    if not candidates:
         return None
+    # A few controls are literally labelled with a leading interaction word.
+    # Preserve those exact labels without broadly adding complete instructions
+    # such as “请帮我点击一下设置” to the target candidates.
+    if source.startswith(("立即播放", "继续播放", "取消下载")):
+        candidates = tuple(dict.fromkeys((*candidates, source)))
     return ClickIntent(
         target_text=candidates[0],
         source_text=source,

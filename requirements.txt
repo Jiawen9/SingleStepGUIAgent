@@ -4,5 +4,9 @@ Pillow>=10.0
 qwen-vl-utils>=0.0.14
 # Use a project-controlled CA bundle for HTTPS model requests.
 certifi>=2024.2.2
+# PaddleOCR cloud jobs and local serving both use HTTP.
+requests>=2.31
+# Offline evaluation reads task workbooks and writes detailed results.
+openpyxl>=3.1
 # Existing iQIYI atomic tools require uiautomator2.
 uiautomator2>=3.0

@@ -11,7 +11,7 @@ from device.xml_hierarchy import (
     nearest_clickable_ancestor,
     parent_map,
 )
-from .instruction import ClickIntent, clean_ui_text
+from engines.instruction import ClickIntent, clean_ui_text
 
 
 @dataclass(frozen=True)
@@ -82,10 +82,3 @@ def resolve_click_match(root: ElementTree.Element, intent: ClickIntent) -> Match
         if result.reason == "ambiguous_text_match":
             return result
     return MatchResult(None, "no_unique_clickable_text_match", 0)
-
-
-def match_click_intent(
-    root: ElementTree.Element, intent: ClickIntent
-) -> ClickTarget | None:
-    """Compatibility helper returning only a successfully resolved target."""
-    return resolve_click_match(root, intent).target

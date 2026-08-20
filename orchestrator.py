@@ -10,13 +10,15 @@ import time
 from pathlib import Path
 
 from engines.base import Engine
+from engines.ocr.client import OcrClient
+from engines.ocr.engine import OcrEngine
+from engines.preprocessing import ClickInstructionPreprocessor, run_preprocessors
 from engines.registry import order_engines
 from engines.validation import build_action_specs, normalize_action, validate_action
 from engines.vla.client import VlaApiClient
 from engines.vla.engine import VlaEngine
 from engines.vla.prompts import load_app_prompt
 from engines.xml.engine import XmlEngine
-from engines.xml.preprocessor import XmlInstructionPreprocessor, run_preprocessors
 from execution.atomic_tools.iqiyi.mode import (
     ACTION_MODES,
     MODE_ENVIRONMENT_VARIABLE,
@@ -27,18 +29,19 @@ from device.adb import AdbController, AdbError
 from storage.artifacts import (
     save_done_screenshot,
     save_draw_screenshot,
+    save_ocr_screenshot,
     save_pipeline_result,
     save_prompt,
 )
 from config import AgentConfig, load_env_file
 from device.xml_hierarchy import XmlExecutionContext
 from input.collector import InputCollector
-from contracts import EngineContext, EngineResult, PipelineResult
+from contracts import DecisionOutcome, EngineContext, EngineResult, ExecutionInput, PipelineResult
 from output.commands import CommandBuilder
 from output.serialization import action_as_prompt_object
 
 
-DEFAULT_ENGINE_ORDER = ("xml", "vla")
+DEFAULT_ENGINE_ORDER = ("xml", "ocr", "vla")
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -62,17 +65,123 @@ class Pipeline:
             model=config.model,
             timeout_seconds=config.timeout_seconds,
         )
+        self.ocr_client = OcrClient(
+            provider=config.ocr_provider,
+            cloud_job_url=config.ocr_cloud_job_url,
+            cloud_token=config.ocr_cloud_token,
+            local_url=config.ocr_local_url,
+            timeout_seconds=config.ocr_timeout_seconds,
+            poll_interval_seconds=config.ocr_poll_interval_seconds,
+            connection_retries=config.ocr_connection_retries,
+            retry_backoff_seconds=config.ocr_retry_backoff_seconds,
+        )
         available = engines or (
             XmlEngine(),
+            OcrEngine(
+                self.ocr_client,
+                min_score=config.ocr_min_score,
+                diagnostic_top_n=config.ocr_diagnostic_top_n,
+            ),
             VlaEngine(self.client),
         )
         self.engines = order_engines(available, engine_order)
-        self.preprocessors = (XmlInstructionPreprocessor(),)
+        self.preprocessors = (ClickInstructionPreprocessor(),)
         self.command_builder = CommandBuilder()
         self.executor = ActionExecutor(
             self.adb,
             project_root,
             iqiyi_action_mode=iqiyi_action_mode,
+        )
+
+    def decide(
+        self,
+        execution_input: ExecutionInput,
+        *,
+        paths=None,
+    ) -> DecisionOutcome:
+        """Run preprocessing and the configured engine chain without execution."""
+        started = time.perf_counter()
+        context = EngineContext(execution_input)
+        run_preprocessors(context, self.preprocessors)
+        engine_results: list[EngineResult] = []
+        selected: EngineResult | None = None
+
+        for engine in self.engines:
+            if not engine.supports(context):
+                continue
+            try:
+                engine_result = engine.run(context)
+            except (OSError, RuntimeError, ValueError) as error:
+                engine_result = EngineResult(
+                    "error",
+                    engine.name,
+                    diagnostics={"error": str(error), "recoverable": True},
+                )
+            engine_results.append(engine_result)
+            if engine_result.source == "ocr" and paths is not None:
+                save_ocr_screenshot(
+                    paths=paths,
+                    snapshot=execution_input.snapshot,
+                    items=list(context.runtime.get("ocr_items", [])),
+                    error=context.runtime.get("ocr_error"),
+                )
+            if engine_result.status == "selected":
+                selected = engine_result
+                break
+
+        if selected is None or selected.action is None:
+            return DecisionOutcome(
+                tuple(engine_results),
+                None,
+                None,
+                {
+                    "engines": sum(
+                        result.timings_seconds.get("engine", 0.0)
+                        for result in engine_results
+                    ),
+                    "decision": time.perf_counter() - started,
+                },
+            )
+
+        action = normalize_action(selected.action)
+        app_prompt = load_app_prompt(execution_input.app_package)
+        action_names = app_prompt.action_names if app_prompt is not None else frozenset()
+        specs = build_action_specs(
+            execution_input.snapshot.width,
+            execution_input.snapshot.height,
+            action_names,
+        )
+        validate_action(
+            action,
+            specs,
+            execution_input.snapshot.width,
+            execution_input.snapshot.height,
+        )
+        if action is not selected.action:
+            selected = type(selected)(
+                selected.status,
+                selected.source,
+                action,
+                selected.diagnostics,
+                selected.timings_seconds,
+            )
+            engine_results[-1] = selected
+        command = self.command_builder.build(
+            action,
+            execution_input.snapshot,
+            app_prompt.app_id if app_prompt is not None else "",
+        )
+        return DecisionOutcome(
+            tuple(engine_results),
+            selected,
+            command,
+            {
+                "engines": sum(
+                    result.timings_seconds.get("engine", 0.0)
+                    for result in engine_results
+                ),
+                "decision": time.perf_counter() - started,
+            },
         )
 
     def run(
@@ -101,25 +210,9 @@ class Pipeline:
             instruction=execution_input.instruction,
             app_package=execution_input.app_package,
         )
-        context = EngineContext(execution_input)
-        run_preprocessors(context, self.preprocessors)
-        engine_results = []
-        selected = None
-        for engine in self.engines:
-            if not engine.supports(context):
-                continue
-            try:
-                engine_result = engine.run(context)
-            except (OSError, RuntimeError, ValueError) as error:
-                engine_result = EngineResult(
-                    "error",
-                    engine.name,
-                    diagnostics={"error": str(error), "recoverable": True},
-                )
-            engine_results.append(engine_result)
-            if engine_result.status == "selected":
-                selected = engine_result
-                break
+        decision = self.decide(execution_input, paths=paths)
+        engine_results = list(decision.engine_results)
+        selected = decision.selected_engine_result
 
         if selected is None or selected.action is None:
             elapsed = {"total": time.perf_counter() - started}
@@ -134,30 +227,10 @@ class Pipeline:
             )
             raise RuntimeError(message)
 
-        action = normalize_action(selected.action)
-        app_prompt = load_app_prompt(execution_input.app_package)
-        action_names = app_prompt.action_names if app_prompt is not None else frozenset()
-        specs = build_action_specs(
-            execution_input.snapshot.width,
-            execution_input.snapshot.height,
-            action_names,
-        )
-        validate_action(
-            action,
-            specs,
-            execution_input.snapshot.width,
-            execution_input.snapshot.height,
-        )
-        if action is not selected.action:
-            selected = type(selected)(
-                selected.status,
-                selected.source,
-                action,
-                selected.diagnostics,
-                selected.timings_seconds,
-            )
-            engine_results[-1] = selected
-        command = self.command_builder.build(action, execution_input.snapshot)
+        action = selected.action
+        command = decision.command
+        if command is None:
+            raise RuntimeError("Selected engine did not produce a command.")
         save_draw_screenshot(paths=paths, snapshot=execution_input.snapshot, selection=action)
 
         xml_context = None
@@ -197,6 +270,7 @@ class Pipeline:
                 result.timings_seconds.get("engine", 0.0)
                 for result in engine_results
             ),
+            "decision": decision.timings_seconds.get("decision", 0.0),
             "execution": (
                 execution.timings_seconds.get("adb_execution", 0.0)
                 if execution is not None
@@ -261,7 +335,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         "--engine",
         dest="engines",
         action="append",
-        choices=("xml", "vla"),
+        choices=("xml", "ocr", "vla"),
         help="Engine in priority order; repeat to configure the chain.",
     )
     parser.add_argument(

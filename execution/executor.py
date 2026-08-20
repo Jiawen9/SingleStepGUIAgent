@@ -47,6 +47,8 @@ class ActionExecutor:
 
     def execute_command(self, command: ExecutionCommand, snapshot: ScreenSnapshot, xml_context: XmlExecutionContext | None = None) -> ExecutionResult:
         action = command.action
+        if command.kind == "evaluation":
+            raise RuntimeError("Evaluation-only commands cannot be executed on a device.")
         if command.kind == "reject":
             reason_type = command.arguments["reason_type"]
             message = {
