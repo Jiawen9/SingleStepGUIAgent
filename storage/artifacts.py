@@ -43,6 +43,7 @@ class ArtifactPaths:
     original_image: Path
     done_image: Path
     draw_image: Path
+    ocr_image: Path
     prompt: Path
     response: Path
     result: Path
@@ -80,6 +81,7 @@ def prepare_run_artifacts(*, project_root: Path, case_id: str) -> ArtifactPaths:
         original_image=directory / f"{safe_case_id}.png",
         done_image=directory / f"{safe_case_id}_done.png",
         draw_image=directory / f"{safe_case_id}_draw.png",
+        ocr_image=directory / f"{safe_case_id}_ocr.png",
         prompt=directory / "prompt.txt",
         response=directory / "response.json",
         result=directory / "result.json",
@@ -89,6 +91,7 @@ def prepare_run_artifacts(*, project_root: Path, case_id: str) -> ArtifactPaths:
         paths.original_image,
         paths.done_image,
         paths.draw_image,
+        paths.ocr_image,
         paths.prompt,
         paths.response,
         paths.result,
@@ -159,6 +162,18 @@ def save_draw_screenshot(
     """Draw the selected action on the original pre-model screenshot."""
     annotated = annotate_screenshot(snapshot, selection)
     _atomic_write_bytes(paths.draw_image, annotated)
+
+
+def save_ocr_screenshot(
+    *,
+    paths: ArtifactPaths,
+    snapshot: ScreenSnapshot,
+    items: list[dict[str, Any]],
+    error: str | None = None,
+) -> None:
+    """Draw every OCR text box on a separate copy of the input screenshot."""
+    annotated = annotate_ocr_screenshot(snapshot, items, error=error)
+    _atomic_write_bytes(paths.ocr_image, annotated)
 
 
 def save_execution_result(
@@ -239,6 +254,9 @@ def save_pipeline_result(
         "timings_seconds": {
             key: round(value, 6)
             for key, value in (timings_seconds or {}).items()
+        },
+        "artifacts": {
+            "ocr_image": paths.ocr_image.name if paths.ocr_image.is_file() else None,
         },
     }
     if execution_input is not None:
@@ -367,6 +385,78 @@ def annotate_screenshot(
 
     if label is not None:
         _draw_label(draw, label, width, height)
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def annotate_ocr_screenshot(
+    snapshot: ScreenSnapshot,
+    items: list[dict[str, Any]],
+    *,
+    error: str | None = None,
+) -> bytes:
+    try:
+        with Image.open(BytesIO(snapshot.png)) as source:
+            source.load()
+            image = source.convert("RGB")
+    except (OSError, ValueError) as exception:
+        raise ValueError("Unable to open the screenshot for OCR annotation.") from exception
+    if image.size != (snapshot.width, snapshot.height):
+        raise ValueError("OCR screenshot dimensions do not match the snapshot metadata.")
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    width, height = image.size
+    scale = max(1.0, min(width, height) / 1000)
+    line_width = max(3, round(4 * scale))
+    font = _load_font(max(16, round(18 * scale)))
+
+    for index, item in enumerate(items, start=1):
+        box = item.get("box")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            left, top, right, bottom = (float(value) for value in box)
+        except (TypeError, ValueError):
+            continue
+        left = round(min(max(left, 0), max(width - 1, 0)))
+        right = round(min(max(right, 0), max(width - 1, 0)))
+        top = round(min(max(top, 0), max(height - 1, 0)))
+        bottom = round(min(max(bottom, 0), max(height - 1, 0)))
+        if right <= left or bottom <= top:
+            continue
+        color = (0, 220, 255, 255)
+        draw.rectangle((left, top, right, bottom), outline=color, width=line_width)
+        text = str(item.get("text", ""))
+        score = item.get("score")
+        score_text = f" {float(score):.3f}" if isinstance(score, (int, float)) else ""
+        label = f"{index}: {text}{score_text}"
+        label_box = draw.textbbox((0, 0), label, font=font)
+        label_width = label_box[2] - label_box[0]
+        label_height = label_box[3] - label_box[1]
+        label_x = left
+        label_y = max(0, top - label_height - 6)
+        draw.rectangle(
+            (
+                label_x,
+                label_y,
+                min(width, label_x + label_width + 8),
+                min(height, label_y + label_height + 6),
+            ),
+            fill=(0, 35, 45, 210),
+        )
+        draw.text(
+            (label_x + 4, label_y + 2 - label_box[1]),
+            label,
+            font=font,
+            fill=(255, 255, 255, 255),
+        )
+
+    if error:
+        _draw_label(draw, f"OCR failed: {error}", width, height)
+    elif not items:
+        _draw_label(draw, "OCR completed: no text boxes", width, height)
+
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()

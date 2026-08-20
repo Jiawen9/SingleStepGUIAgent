@@ -1,4 +1,4 @@
-"""XML-engine preprocessing that never mutates run input."""
+"""Shared instruction preprocessing for deterministic engines."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ from typing import Protocol
 
 from contracts import EngineContext
 from .instruction import parse_click_instruction
+
+
+CLICK_INSTRUCTION_KEY = "click_instruction"
 
 
 class Preprocessor(Protocol):
@@ -16,11 +19,13 @@ class Preprocessor(Protocol):
     def process(self, context: EngineContext) -> None: ...
 
 
-class XmlInstructionPreprocessor:
-    name = "xml_instruction"
+class ClickInstructionPreprocessor:
+    """Parse a click intent once for UITree and OCR engines."""
+
+    name = CLICK_INSTRUCTION_KEY
 
     def supports(self, context: EngineContext) -> bool:
-        return context.execution_input.xml_root is not None
+        return True
 
     def process(self, context: EngineContext) -> None:
         context.prepared[self.name] = parse_click_instruction(

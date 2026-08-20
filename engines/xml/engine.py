@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from contracts import EngineContext, EngineResult
+from engines.preprocessing import CLICK_INSTRUCTION_KEY
 from .matcher import resolve_click_match
 from .router import click_action_for_target
 
@@ -19,7 +20,7 @@ class XmlEngine:
     def run(self, context: EngineContext) -> EngineResult:
         started = time.perf_counter()
         execution_input = context.execution_input
-        intent = context.prepared.get("xml_instruction")
+        intent = context.prepared.get(CLICK_INSTRUCTION_KEY)
         if intent is None:
             return EngineResult("no_match", self.name, diagnostics={"reason": "not_a_simple_click_instruction"}, timings_seconds={"engine": time.perf_counter() - started})
         try:

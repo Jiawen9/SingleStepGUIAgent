@@ -6,7 +6,7 @@ from execution.executor import vla_coordinate_to_pixel
 from contracts import ActionSelection, ExecutionCommand, ScreenSnapshot
 
 
-ATOMIC_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
+IQIYI_ATOMIC_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     "player_pause": ("execution.atomic_tools.iqiyi.pause", ()),
     "player_seek_to_start": (
         "execution.atomic_tools.iqiyi.seek_to_start",
@@ -34,10 +34,26 @@ ATOMIC_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
     ),
 }
 
+APP_ATOMIC_TOOLS = {
+    "iqiyi": IQIYI_ATOMIC_TOOLS,
+    "netease_cloudmusic": {},
+    "ximalaya": {},
+    "douyin": {},
+    # Tencent Video deliberately has no implementation yet. Its generic
+    # player_* actions must never fall through to iQIYI's same-named tools.
+    "tencent_video": {},
+}
+
 
 class CommandBuilder:
+    def __init__(self, *, allow_unmapped: bool = False):
+        self.allow_unmapped = allow_unmapped
+
     def build(
-        self, action: ActionSelection, snapshot: ScreenSnapshot
+        self,
+        action: ActionSelection,
+        snapshot: ScreenSnapshot,
+        app_id: str = "iqiyi",
     ) -> ExecutionCommand:
         name = action.name
         arguments = action.arguments
@@ -69,8 +85,15 @@ class CommandBuilder:
             )
         if name == "type":
             return ExecutionCommand("adb", "type", {"text": arguments["text"]}, action)
-        tool = ATOMIC_TOOLS.get(name)
+        tool = APP_ATOMIC_TOOLS.get(app_id, {}).get(name)
         if tool is None:
+            if self.allow_unmapped:
+                return ExecutionCommand(
+                    "evaluation",
+                    "unmapped_action",
+                    dict(arguments),
+                    action,
+                )
             raise ValueError(f"No command mapping is registered for action: {name}")
         module_name, templates = tool
         rendered = tuple(template.format(**arguments) for template in templates)

@@ -27,10 +27,54 @@ def build_action_specs(
     # in Python so runtime execution never depends on a schema file.
     del width, height
     if app_action_names is None:
-        return ACTION_SPECS
+        deprecated_prefixes = ("cloudmusic_", "ximalaya_", "douyin_", "tencent_video_")
+        return tuple(
+            spec
+            for spec in ACTION_SPECS
+            if not spec.name.startswith(deprecated_prefixes)
+        )
     common = {"click", "swipe", "type", "reject"}
     allowed = common | set(app_action_names)
-    return tuple(spec for spec in ACTION_SPECS if spec.name in allowed)
+    specs = tuple(spec for spec in ACTION_SPECS if spec.name in allowed)
+    if "player_set_sleep_timer" in allowed:
+        specs += (
+            ActionSpec(
+                "player_set_sleep_timer",
+                "设置当前播放器定时暂停的分钟数。",
+                _object_parameters(
+                    {"minutes": {"type": "integer", "enum": [15, 30, 60, 90]}},
+                    ["minutes"],
+                ),
+            ),
+        )
+    if "player_resume" in allowed:
+        specs += (ActionSpec("player_resume", "继续播放当前已暂停的视频。", _EMPTY_PARAMETERS),)
+    app_speeds = None
+    if "player_set_sleep_timer" in allowed:
+        app_speeds = ["0.5x", "1.0x", "1.5x", "2.0x", "2.5x", "3.0x"]
+    elif "player_resume" in allowed:
+        app_speeds = ["0.5x", "0.75x", "1.0x", "1.25x", "1.5x"]
+    elif (
+        "player_set_playback_speed" in allowed
+        and "player_next_episode" in allowed
+        and "player_previous_episode" not in allowed
+    ):
+        app_speeds = ["0.5x", "1.0x", "1.25x", "1.5x"]
+    if app_speeds is not None:
+        specs = tuple(
+            ActionSpec(
+                spec.name,
+                spec.description,
+                _object_parameters(
+                    {"speed": {"type": "string", "enum": app_speeds}},
+                    ["speed"],
+                ),
+            )
+            if spec.name == "player_set_playback_speed"
+            else spec
+            for spec in specs
+        )
+    return specs
 
 
 def normalize_action(selection: ActionSelection) -> ActionSelection:
@@ -153,6 +197,93 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ),
     ),
     ActionSpec(
+        "cloudmusic_search",
+        "在网易云音乐中搜索歌曲、歌手、专辑、歌单或播客。",
+        _object_parameters(
+            {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                }
+            },
+            ["query"],
+        ),
+    ),
+    ActionSpec(
+        "ximalaya_search",
+        "在喜马拉雅中搜索节目、专辑、主播或声音。",
+        _object_parameters(
+            {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                }
+            },
+            ["query"],
+        ),
+    ),
+    ActionSpec(
+        "ximalaya_set_playback_speed",
+        "设置喜马拉雅当前内容的播放倍速。",
+        _object_parameters(
+            {
+                "speed": {
+                    "type": "string",
+                    "enum": ["0.5x", "1.0x", "1.5x", "2.0x", "2.5x", "3.0x"],
+                }
+            },
+            ["speed"],
+        ),
+    ),
+    ActionSpec(
+        "ximalaya_set_sleep_timer",
+        "设置喜马拉雅定时暂停播放的分钟数。",
+        _object_parameters(
+            {
+                "minutes": {
+                    "type": "integer",
+                    "enum": [15, 30, 60, 90],
+                }
+            },
+            ["minutes"],
+        ),
+    ),
+    ActionSpec(
+        "douyin_search",
+        "在抖音中搜索视频、用户、话题或内容。",
+        _object_parameters(
+            {
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                }
+            },
+            ["query"],
+        ),
+    ),
+    ActionSpec(
+        "douyin_set_playback_speed",
+        "设置抖音当前视频的播放倍速。",
+        _object_parameters(
+            {
+                "speed": {
+                    "type": "string",
+                    "enum": ["0.5x", "1.0x", "1.25x", "1.5x"],
+                }
+            },
+            ["speed"],
+        ),
+    ),
+    ActionSpec("douyin_pause", "暂停抖音当前视频。", _EMPTY_PARAMETERS),
+    ActionSpec(
+        "douyin_next_episode",
+        "播放抖音当前短剧或连续内容的下一集。",
+        _EMPTY_PARAMETERS,
+    ),
+    ActionSpec(
         "reject",
         "无法可靠执行时拒绝；目标不可见时 reason_type 输出 TARGET_NOT_VISIBLE；用户提出的目标不受当前场景支持时输出 UNSUPPORTED_TARGET。",
         _object_parameters(
@@ -173,8 +304,8 @@ def validate_action(
 ) -> None:
     if width <= 0 or height <= 0:
         raise ValueError("Screen dimensions must be positive.")
-    known = {spec.name for spec in specs}
-    if selection.name not in known:
+    specs_by_name = {spec.name: spec for spec in specs}
+    if selection.name not in specs_by_name:
         raise ValueError(f"Model selected an unknown action: {selection.name}")
     if not isinstance(selection.arguments, dict):
         raise ValueError("Action arguments must be a JSON object.")
@@ -210,15 +341,12 @@ def validate_action(
             raise ValueError("Invalid iQIYI quality.")
     elif selection.name == "player_set_playback_speed":
         _require_exact_keys(arguments, {"speed"})
-        if arguments["speed"] not in {
-            "0.75x",
-            "1.0x",
-            "1.25x",
-            "1.5x",
-            "2.0x",
-            "3.0x",
-        }:
-            raise ValueError("Invalid iQIYI playback speed.")
+        selected_spec = specs_by_name[selection.name]
+        allowed_speeds = set(
+            selected_spec.parameters["properties"]["speed"]["enum"]
+        )
+        if arguments["speed"] not in allowed_speeds:
+            raise ValueError("Invalid player playback speed.")
     elif selection.name == "player_search":
         _require_exact_keys(arguments, {"query"})
         query = arguments["query"]
@@ -228,9 +356,13 @@ def validate_action(
             or len(query) > 100
             or any(ord(character) < 32 for character in query)
         ):
-            raise ValueError(
-                "iQIYI search query must contain 1 to 100 printable characters."
-            )
+            raise ValueError("Search query must contain 1 to 100 printable characters.")
+    elif selection.name == "player_set_sleep_timer":
+        _require_exact_keys(arguments, {"minutes"})
+        if arguments["minutes"] not in {15, 30, 60, 90}:
+            raise ValueError("Invalid player sleep timer.")
+    elif selection.name == "player_resume":
+        _require_exact_keys(arguments, set())
     elif selection.name.startswith("iqiyi_"):
         _require_exact_keys(arguments, set())
     elif selection.name == "reject":

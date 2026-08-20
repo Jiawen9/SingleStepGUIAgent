@@ -18,7 +18,7 @@ from contracts import (
     ScreenSnapshot,
 )
 from orchestrator import Pipeline
-from engines.xml.preprocessor import XmlInstructionPreprocessor
+from engines.preprocessing import ClickInstructionPreprocessor
 from engines.xml.engine import XmlEngine
 
 
@@ -62,6 +62,73 @@ class PipelineContractTests(unittest.TestCase):
         self.assertEqual(command.kind, "atomic_tool")
         self.assertEqual(command.arguments["argv"], ["--quality", "720p"])
 
+    def test_cloudmusic_search_has_no_tool_mapping_yet(self):
+        with self.assertRaisesRegex(ValueError, "No command mapping"):
+            CommandBuilder().build(
+                ActionSelection("player_search", {"query": "周杰伦"}),
+                ScreenSnapshot(b"", 1920, 1200, "device"),
+                app_id="netease_cloudmusic",
+            )
+
+    def test_ximalaya_actions_have_no_tool_mapping_yet(self):
+        actions = (
+            ActionSelection("player_search", {"query": "三体"}),
+            ActionSelection("player_set_playback_speed", {"speed": "1.5x"}),
+            ActionSelection("player_set_sleep_timer", {"minutes": 30}),
+        )
+        for action in actions:
+            with self.subTest(action=action.name), self.assertRaisesRegex(
+                ValueError, "No command mapping"
+            ):
+                CommandBuilder().build(
+                    action, ScreenSnapshot(b"", 1920, 1200, "device"), app_id="ximalaya"
+                )
+
+    def test_douyin_actions_have_no_tool_mapping_yet(self):
+        actions = (
+            ActionSelection("player_search", {"query": "美食"}),
+            ActionSelection("player_set_playback_speed", {"speed": "1.25x"}),
+            ActionSelection("player_pause", {}),
+            ActionSelection("player_next_episode", {}),
+        )
+        for action in actions:
+            with self.subTest(action=action.name), self.assertRaisesRegex(
+                ValueError, "No command mapping"
+            ):
+                CommandBuilder().build(
+                    action, ScreenSnapshot(b"", 1920, 1200, "device"), app_id="douyin"
+                )
+
+    def test_tencent_video_actions_have_no_tool_mapping_yet(self):
+        actions = (
+            ActionSelection("player_search", {"query": "庆余年"}),
+            ActionSelection("player_set_playback_speed", {"speed": "1.25x"}),
+            ActionSelection("player_pause", {}),
+            ActionSelection("player_resume", {}),
+            ActionSelection("player_previous_episode", {}),
+            ActionSelection("player_next_episode", {}),
+        )
+        for action in actions:
+            with self.subTest(action=action.name), self.assertRaisesRegex(
+                ValueError, "No command mapping"
+            ):
+                CommandBuilder().build(
+                    action,
+                    ScreenSnapshot(b"", 1920, 1200, "device"),
+                    app_id="tencent_video",
+                )
+
+    def test_evaluation_command_builder_keeps_unmapped_app_action(self):
+        action = ActionSelection("player_search", {"query": "庆余年"})
+        command = CommandBuilder(allow_unmapped=True).build(
+            action,
+            ScreenSnapshot(b"", 1920, 1200, "device"),
+            app_id="tencent_video",
+        )
+        self.assertEqual(command.kind, "evaluation")
+        self.assertEqual(command.target, "unmapped_action")
+        self.assertEqual(command.action, action)
+
     def test_swipe_coordinates_map_from_thousandths_to_original_pixels(self):
         command = CommandBuilder().build(
             ActionSelection(
@@ -89,7 +156,7 @@ class PipelineContractTests(unittest.TestCase):
             root,
         )
         context = EngineContext(run_input)
-        XmlInstructionPreprocessor().process(context)
+        ClickInstructionPreprocessor().process(context)
         result = XmlEngine().run(context)
         self.assertEqual(result.status, "selected")
         self.assertEqual(result.action.name, "click")

@@ -21,8 +21,41 @@ class UiTreeRuleTests(unittest.TestCase):
             parse_click_instruction("点击取消下载").target_text,
             "取消下载",
         )
-        self.assertIsNone(parse_click_instruction("搜索三国演义"))
+        self.assertEqual(parse_click_instruction("搜索三国演义").target_text, "三国演义")
         self.assertIsNone(parse_click_instruction("打开后点击播放"))
+
+    def test_task_style_verbs_produce_noun_first_and_full_text_fallback(self):
+        cases = {
+            "查看收藏": "收藏",
+            "播放大力水手": "大力水手",
+            "选集“2026-08-07期”": "2026-08-07期",
+            "搜索海绵宝宝": "海绵宝宝",
+            "预约731真相": "731真相",
+            "选择迷幻电音": "迷幻电音",
+            "收听诡秘之主": "诡秘之主",
+            "使用AI搜": "AI搜",
+            "进入个人中心": "个人中心",
+            "浏览同城": "同城",
+            "回关白眼中山琅": "白眼中山琅",
+            "看电视": "电视",
+            "进行屏保设置": "屏保设置",
+            "筛选一下": "筛选",
+            "取消": "取消",
+        }
+        for instruction, target in cases.items():
+            with self.subTest(instruction=instruction):
+                intent = parse_click_instruction(instruction)
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent.target_text, target)
+
+    def test_visible_action_label_remains_an_exact_fallback(self):
+        for instruction in (
+            "立即播放", "继续播放", "取消下载", "立即续费", "10分钟新闻早餐",
+        ):
+            with self.subTest(instruction=instruction):
+                intent = parse_click_instruction(instruction)
+                self.assertIsNotNone(intent)
+                self.assertIn(instruction, intent.target_candidates)
 
     def test_click_instruction_extracts_target_from_varied_wording(self):
         cases = {

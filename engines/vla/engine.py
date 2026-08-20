@@ -10,7 +10,7 @@ from .client import VlaApiClient
 
 class VlaEngine:
     name = "vla"
-    priority = 200
+    priority = 300
 
     def __init__(self, client: VlaApiClient):
         self.client = client
