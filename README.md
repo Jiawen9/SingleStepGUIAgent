@@ -98,19 +98,36 @@ python -m orchestrator --help
 评测只读取静态截图和 XML，不操作设备：
 
 ```powershell
-python evaluator.py test.xlsx --mode xml-ocr
-python evaluator.py test.xlsx --mode vla-basic
-python evaluator.py test.xlsx --mode vla-combo --workers 4
-python evaluator.py test.xlsx --mode xml-ocr-vla --workers 4
+# 默认：XML + OCR + VLA 串行回退，VLA 开启组合动作
+python evaluator.py test.xlsx --workers 4
+
+# 串行回退，VLA 仅开放基础动作
+python evaluator.py test.xlsx --engine-strategy serial --vla-mode vla-basic --workers 4
+
+# XML、OCR、VLA 并行全跑取并集，VLA 开启组合动作
+python evaluator.py test.xlsx --engine-strategy parallel --vla-mode vla-combo --workers 4
+
+# XML、OCR、VLA 并行全跑取并集，VLA 仅开放基础动作
+python evaluator.py test.xlsx --engine-strategy parallel --vla-mode vla-basic --workers 4
 ```
 
-`vla-basic` 只开放基础动作；`vla-combo` 根据 UI-TREE 中识别到的前台 App 加载对应组合动作。`xml-ocr-vla` 的最后一级 VLA 同样开启组合动作，`xml-ocr` 不调用 VLA。
+评测固定启用 XML、OCR、VLA 三个引擎，不再通过命令行区分仅 VLA、XML+OCR 或 XML+OCR+VLA。`--engine-strategy` 与 `--vla-mode` 相互独立：前者控制三个引擎如何执行和汇总，后者只控制 VLA 的动作空间。
 
-多引擎模式在每条用例内按顺序串行回退：`xml-ocr` 使用 `XML → OCR`，`xml-ocr-vla` 使用 `XML → OCR → VLA`。当前引擎只要选出动作即停止，不命中或发生可恢复错误时才进入下一个引擎；最终只按选中动作判分，不再执行全部引擎后取正确结果并集。`--workers` 仅控制不同 Excel 用例行之间的并发。
+`--engine-strategy` 默认值为 `serial`：
 
-总览按测试集能力列固定汇总为：`文本-清晰`（文本定位 + 意图清晰）、`文本-模糊`（文本定位 + 意图模糊）、`图标-清晰`（图标定位 + 意图清晰）、`图标-模糊`（图标定位 + 意图模糊）、`拒答`（二级能力为拒答）和`总体`。结果以串行回退链最终选中的动作为准。
+- `serial`：按照 `XML → OCR → VLA` 串行回退；当前引擎只要选出动作即停止，只有不命中或发生可恢复错误时才进入下一个引擎。
+- `parallel`：同时运行 XML、OCR、VLA，等待三个引擎全部完成后取正确结果并集；任意一个引擎判定正确，该用例即为综合正确。报告会保留每个引擎的动作、判分、错误和 artifact。
 
-评测默认使用单线程；通过 `--workers N` 可按用例行并发执行。VLA/OCR 服务可能有限流，建议从 `--workers 4` 开始调整。
+`--vla-mode` 默认值为 `vla-combo`：
+
+- `vla-basic`：VLA 只开放基础动作。
+- `vla-combo`：VLA 根据 UI-TREE 中识别到的前台 App 加载对应组合动作。
+
+`--workers` 只控制不同 Excel 用例行之间的并发，与 `--engine-strategy`、`--vla-mode` 相互独立。使用 `parallel + workers=4` 时，最多可能同时运行 12 个引擎任务，请根据 OCR/VLA 服务限流能力调整。
+
+总览按测试集能力列固定汇总为：`文本-清晰`（文本定位 + 意图清晰）、`文本-模糊`（文本定位 + 意图模糊）、`图标-清晰`（图标定位 + 意图清晰）、`图标-模糊`（图标定位 + 意图模糊）、`拒答`（二级能力为拒答）和`总体`。串行策略按最终选中动作统计；并行策略按各引擎正确结果的并集统计，并在能力分类表中并列给出 `XML+OCR` 并集和 VLA 的正确数、成功率。并行能力分类表中的成功率统一以对应能力分类的全部任务数为分母。
+
+默认使用 `--engine-strategy serial --vla-mode vla-combo --workers 1`；通过 `--workers N` 可按用例行并发执行。VLA/OCR 服务可能有限流，建议从较小并发开始调整。
 运行过程中会实时输出每条用例的 `START` 和 `PASS`/`FAIL`/`ERROR` 状态、完成进度与耗时；输出使用即时刷新，适合在远程终端观察。
 单个模型响应无法解析或某个引擎抛出普通异常时，该错误只记录到当前引擎和用例，批量评测会继续执行其他引擎及后续用例；手动中断仍会正常停止程序。
 

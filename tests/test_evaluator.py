@@ -76,6 +76,34 @@ class ParseFailurePipeline:
         return click_outcome(pixel_x=100, pixel_y=50)
 
 
+class EngineOverlapTracker:
+    def __init__(self):
+        self.active = 0
+        self.peak_active = 0
+        self.lock = threading.Lock()
+
+
+class DelayedEnginePipeline(StaticPipeline):
+    def __init__(self, outcome, tracker, delay=0.05):
+        super().__init__(outcome)
+        self.tracker = tracker
+        self.delay = delay
+
+    def decide(self, execution_input, *, paths=None):
+        self.inputs.append(execution_input)
+        with self.tracker.lock:
+            self.tracker.active += 1
+            self.tracker.peak_active = max(
+                self.tracker.peak_active, self.tracker.active
+            )
+        try:
+            time.sleep(self.delay)
+            return self.outcome
+        finally:
+            with self.tracker.lock:
+                self.tracker.active -= 1
+
+
 def click_outcome(x=500, y=500, pixel_x=100, pixel_y=50, source="vla"):
     action = ActionSelection("click", {"x": x, "y": y})
     selected = EngineResult("selected", source, action=action, timings_seconds={"engine": 0.2})
@@ -91,6 +119,14 @@ def click_outcome(x=500, y=500, pixel_x=100, pixel_y=50, source="vla"):
 def no_match_outcome(source):
     result = EngineResult("no_match", source, timings_seconds={"engine": 0.1})
     return DecisionOutcome((result,), None, None, {"engines": 0.1, "decision": 0.12})
+
+
+def three_engine_pipelines(*, xml=None, ocr=None, vla=None):
+    return {
+        "xml": xml or StaticPipeline(no_match_outcome("xml")),
+        "ocr": ocr or StaticPipeline(no_match_outcome("ocr")),
+        "vla": vla or StaticPipeline(no_match_outcome("vla")),
+    }
 
 
 class EvaluationComparisonTests(unittest.TestCase):
@@ -179,11 +215,9 @@ class EvaluationWorkbookTests(unittest.TestCase):
         self.assertEqual(ability_category("图标定位", "意图模糊"), "图标-模糊")
         self.assertEqual(ability_category("拒答", ""), "拒答")
 
-    def test_vla_combo_modes(self):
-        self.assertFalse(_uses_vla_combo("xml-ocr"))
+    def test_vla_modes(self):
         self.assertFalse(_uses_vla_combo("vla-basic"))
         self.assertTrue(_uses_vla_combo("vla-combo"))
-        self.assertTrue(_uses_vla_combo("xml-ocr-vla"))
 
     def _make_workbook(self, root, instructions):
         image_dir = root / "device_captures"
@@ -297,7 +331,6 @@ class EvaluationWorkbookTests(unittest.TestCase):
                 output_path=output,
                 pipeline=pipelines,
                 project_root=root,
-                mode="xml-ocr-vla",
             )
             self.assertEqual(len(records), 1)
             self.assertTrue(records[0].correct)
@@ -330,6 +363,7 @@ class EvaluationWorkbookTests(unittest.TestCase):
             pipelines = {
                 "xml": StaticPipeline(click_outcome(pixel_x=150, pixel_y=50, source="xml")),
                 "ocr": StaticPipeline(click_outcome(pixel_x=100, pixel_y=50, source="ocr")),
+                "vla": StaticPipeline(click_outcome(pixel_x=100, pixel_y=50, source="vla")),
             }
 
             records = evaluate_workbook(
@@ -337,12 +371,195 @@ class EvaluationWorkbookTests(unittest.TestCase):
                 output_path=root / "result.xlsx",
                 pipeline=pipelines,
                 project_root=root,
-                mode="xml-ocr",
             )
 
             self.assertFalse(records[0].correct)
             self.assertEqual(records[0].selected_engine, "xml")
             self.assertEqual(pipelines["ocr"].inputs, [])
+            self.assertEqual(pipelines["vla"].inputs, [])
+
+    def test_parallel_strategy_runs_all_engines_concurrently_and_unions_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._make_workbook(root, ["点击设置"])
+            tracker = EngineOverlapTracker()
+            pipelines = {
+                "xml": DelayedEnginePipeline(
+                    click_outcome(pixel_x=150, pixel_y=50, source="xml"), tracker
+                ),
+                "ocr": DelayedEnginePipeline(
+                    click_outcome(pixel_x=100, pixel_y=50, source="ocr"), tracker
+                ),
+                "vla": DelayedEnginePipeline(no_match_outcome("vla"), tracker),
+            }
+            output = root / "result.xlsx"
+
+            records = evaluate_workbook(
+                source,
+                output_path=output,
+                pipeline=pipelines,
+                project_root=root,
+                workers=1,
+                engine_strategy="parallel",
+            )
+
+            record = records[0]
+            self.assertGreater(tracker.peak_active, 1)
+            self.assertEqual(len(pipelines["xml"].inputs), 1)
+            self.assertEqual(len(pipelines["ocr"].inputs), 1)
+            self.assertEqual(len(pipelines["vla"].inputs), 1)
+            self.assertTrue(record.correct)
+            self.assertEqual(record.selected_engine, "xml,ocr")
+            self.assertEqual(
+                record.engine_correct,
+                {"xml": False, "ocr": True, "vla": False},
+            )
+            self.assertEqual(list(json.loads(record.actual_json)), ["xml", "ocr", "vla"])
+            self.assertEqual(
+                list(json.loads(record.pixel_action_json)), ["xml", "ocr", "vla"]
+            )
+            report = load_workbook(output, data_only=False)
+            self.assertEqual(report[SUMMARY_SHEET]["E2"].value, "parallel")
+
+    def test_parallel_strategy_keeps_engine_error_but_passes_on_other_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._make_workbook(root, ["解析失败"])
+            pipelines = three_engine_pipelines(
+                xml=ParseFailurePipeline(),
+                ocr=StaticPipeline(
+                    click_outcome(pixel_x=100, pixel_y=50, source="ocr")
+                ),
+            )
+
+            records = evaluate_workbook(
+                source,
+                output_path=root / "result.xlsx",
+                pipeline=pipelines,
+                project_root=root,
+                engine_strategy="parallel",
+            )
+
+            self.assertTrue(records[0].correct)
+            self.assertEqual(records[0].selected_engine, "ocr")
+            self.assertEqual(records[0].error, "")
+            details = json.loads(records[0].engine_details_json)
+            self.assertIn("model action is missing", details["xml"]["error"])
+
+    def test_parallel_combo_runs_all_engines_and_injects_app_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_dir = root / "device_captures"
+            capture_dir.mkdir()
+            Image.new("RGB", (201, 101), "white").save(capture_dir / "CASE.png")
+            (capture_dir / "CASE.xml").write_text(
+                '<hierarchy><node package="com.qiyi.video.pad"/></hierarchy>',
+                encoding="utf-8",
+            )
+            source = root / "test.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = TASK_SHEET
+            sheet.append(
+                ["任务指令", "图片ID", "UI-TREE", "二级能力", "三级能力", "结果输出"]
+            )
+            sheet.append(
+                [
+                    "点击设置",
+                    "CASE.png",
+                    "CASE.xml",
+                    "文本定位",
+                    "意图清晰",
+                    json.dumps({"action": "click", "bbox": [[90, 40, 110, 60]]}),
+                ]
+            )
+            workbook.save(source)
+            pipelines = {
+                "xml": StaticPipeline(no_match_outcome("xml")),
+                "ocr": StaticPipeline(no_match_outcome("ocr")),
+                "vla": StaticPipeline(
+                    click_outcome(pixel_x=100, pixel_y=50, source="vla")
+                ),
+            }
+
+            output = root / "result.xlsx"
+            records = evaluate_workbook(
+                source,
+                output_path=output,
+                pipeline=pipelines,
+                project_root=root,
+                vla_mode="vla-combo",
+                engine_strategy="parallel",
+            )
+
+            self.assertTrue(records[0].correct)
+            self.assertEqual(records[0].engine_correct, {"xml": False, "ocr": False, "vla": True})
+            self.assertEqual(pipelines["xml"].inputs[0].app_package, None)
+            self.assertEqual(pipelines["ocr"].inputs[0].app_package, None)
+            self.assertEqual(
+                pipelines["vla"].inputs[0].app_package, "com.qiyi.video.pad"
+            )
+            report = load_workbook(output, data_only=False)
+            summary = report[SUMMARY_SHEET]
+            self.assertEqual(summary["B2"].value, "XML+OCR+VLA")
+            self.assertEqual(summary["B3"].value, "vla-combo")
+            self.assertEqual(summary["K17"].value, "XML+OCR并集正确数")
+            self.assertEqual(summary["L17"].value, "XML+OCR并集成功率")
+            self.assertIn("'评测明细'!T2:T2", summary["K18"].value)
+            self.assertIn("'评测明细'!U2:U2", summary["K18"].value)
+            self.assertIn("-COUNTIFS", summary["K18"].value)
+            self.assertEqual(summary["J18"].value, "=IFERROR(I18/B18,0)")
+            self.assertEqual(summary["L18"].value, "=IFERROR(K18/B18,0)")
+
+    def test_vla_basic_does_not_inject_app_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            capture_dir = root / "device_captures"
+            capture_dir.mkdir()
+            Image.new("RGB", (201, 101), "white").save(capture_dir / "CASE.png")
+            (capture_dir / "CASE.xml").write_text(
+                '<hierarchy><node package="com.qiyi.video.pad"/></hierarchy>',
+                encoding="utf-8",
+            )
+            source = root / "test.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = TASK_SHEET
+            sheet.append(
+                ["任务指令", "图片ID", "UI-TREE", "二级能力", "三级能力", "结果输出"]
+            )
+            sheet.append(
+                [
+                    "点击设置",
+                    "CASE.png",
+                    "CASE.xml",
+                    "文本定位",
+                    "意图清晰",
+                    json.dumps({"action": "click", "bbox": [[90, 40, 110, 60]]}),
+                ]
+            )
+            workbook.save(source)
+            pipelines = three_engine_pipelines(
+                vla=StaticPipeline(
+                    click_outcome(pixel_x=100, pixel_y=50, source="vla")
+                )
+            )
+
+            output = root / "result.xlsx"
+            records = evaluate_workbook(
+                source,
+                output_path=output,
+                pipeline=pipelines,
+                project_root=root,
+                vla_mode="vla-basic",
+                engine_strategy="parallel",
+            )
+
+            self.assertTrue(records[0].correct)
+            self.assertIsNone(pipelines["vla"].inputs[0].app_package)
+            summary = load_workbook(output, data_only=False)[SUMMARY_SHEET]
+            self.assertEqual(summary["B3"].value, "vla-basic")
+            self.assertEqual(summary["K17"].value, "XML+OCR并集正确数")
 
     def test_missing_columns_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -356,9 +573,8 @@ class EvaluationWorkbookTests(unittest.TestCase):
                 evaluate_workbook(
                     source,
                     output_path=root / "out.xlsx",
-                    pipeline=StaticPipeline(click_outcome()),
+                    pipeline=three_engine_pipelines(),
                     project_root=root,
-                    mode="xml-ocr",
                 )
 
     def test_concurrent_evaluation_overlaps_and_preserves_row_order(self):
@@ -367,13 +583,14 @@ class EvaluationWorkbookTests(unittest.TestCase):
             source = self._make_workbook(root, ["慢", "中", "快"])
             output = root / "result.xlsx"
             pipeline = ConcurrentPipeline(click_outcome(pixel_x=100, pixel_y=50))
+            pipelines = three_engine_pipelines(vla=pipeline)
 
             records = evaluate_workbook(
                 source,
                 output_path=output,
-                pipeline=pipeline,
+                pipeline=pipelines,
                 project_root=root,
-                mode="vla-basic",
+                vla_mode="vla-basic",
                 workers=3,
             )
 
@@ -391,13 +608,14 @@ class EvaluationWorkbookTests(unittest.TestCase):
             root = Path(directory)
             source = self._make_workbook(root, ["快", "失败", "中"])
             pipeline = ConcurrentPipeline(click_outcome(pixel_x=100, pixel_y=50))
+            pipelines = three_engine_pipelines(vla=pipeline)
 
             records = evaluate_workbook(
                 source,
                 output_path=root / "result.xlsx",
-                pipeline=pipeline,
+                pipeline=pipelines,
                 project_root=root,
-                mode="vla-basic",
+                vla_mode="vla-basic",
                 workers=3,
             )
 
@@ -410,13 +628,14 @@ class EvaluationWorkbookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self._make_workbook(root, ["快", "解析失败", "中"])
+            pipelines = three_engine_pipelines(vla=ParseFailurePipeline())
 
             records = evaluate_workbook(
                 source,
                 output_path=root / "result.xlsx",
-                pipeline=ParseFailurePipeline(),
+                pipeline=pipelines,
                 project_root=root,
-                mode="vla-basic",
+                vla_mode="vla-basic",
                 workers=3,
             )
 
@@ -434,18 +653,67 @@ class EvaluationWorkbookTests(unittest.TestCase):
             parse_arguments(["test.xlsx", "--workers", "-2"])
         defaults = parse_arguments(["test.xlsx"])
         self.assertEqual(defaults.workers, 1)
-        self.assertEqual(defaults.mode, "xml-ocr-vla")
-        for mode in ("xml-ocr", "vla-basic", "vla-combo", "xml-ocr-vla"):
-            self.assertEqual(parse_arguments(["test.xlsx", "--mode", mode]).mode, mode)
+        self.assertEqual(defaults.vla_mode, "vla-combo")
+        self.assertFalse(hasattr(defaults, "mode"))
+        self.assertEqual(defaults.engine_strategy, "serial")
+        self.assertEqual(
+            parse_arguments(
+                ["test.xlsx", "--engine-strategy", "parallel"]
+            ).engine_strategy,
+            "parallel",
+        )
+        with self.assertRaises(SystemExit):
+            parse_arguments(["test.xlsx", "--engine-strategy", "invalid"])
+        for vla_mode in ("vla-basic", "vla-combo"):
+            self.assertEqual(
+                parse_arguments(["test.xlsx", "--vla-mode", vla_mode]).vla_mode,
+                vla_mode,
+            )
+        with self.assertRaises(SystemExit):
+            parse_arguments(["test.xlsx", "--vla-mode", "invalid"])
+        with self.assertRaises(SystemExit):
+            parse_arguments(["test.xlsx", "--mode", "xml-ocr-vla"])
         with self.assertRaisesRegex(ValueError, "at least 1"):
             evaluate_workbook(
                 Path("missing.xlsx"),
                 output_path=Path("unused.xlsx"),
-                pipeline=StaticPipeline(click_outcome()),
+                pipeline=three_engine_pipelines(),
                 project_root=Path.cwd(),
-                mode="xml-ocr",
                 workers=0,
             )
+        with self.assertRaisesRegex(ValueError, "engine_strategy"):
+            evaluate_workbook(
+                Path("missing.xlsx"),
+                output_path=Path("unused.xlsx"),
+                pipeline=three_engine_pipelines(),
+                project_root=Path.cwd(),
+                engine_strategy="invalid",
+            )
+        with self.assertRaisesRegex(ValueError, "vla_mode"):
+            evaluate_workbook(
+                Path("missing.xlsx"),
+                output_path=Path("unused.xlsx"),
+                pipeline=three_engine_pipelines(),
+                project_root=Path.cwd(),
+                vla_mode="invalid",
+            )
+
+    def test_all_three_engine_pipelines_are_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._make_workbook(root, ["点击设置"])
+            with self.assertRaisesRegex(
+                ValueError, "Missing evaluator pipelines: vla"
+            ):
+                evaluate_workbook(
+                    source,
+                    output_path=root / "result.xlsx",
+                    pipeline={
+                        "xml": StaticPipeline(no_match_outcome("xml")),
+                        "ocr": StaticPipeline(no_match_outcome("ocr")),
+                    },
+                    project_root=root,
+                )
 
 
 if __name__ == "__main__":

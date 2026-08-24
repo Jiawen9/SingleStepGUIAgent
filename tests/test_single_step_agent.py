@@ -755,7 +755,7 @@ class VlaImageInputTests(unittest.TestCase):
         self.assertIn('{"action":"click","coordinate":[x,y]}', compact)
         self.assertIn('"start_coordinate":[x,y]', compact)
         self.assertIn('{"action":"type","text":"要输入的文本"}', compact)
-        self.assertIn("不自动点击输入框、不清空原内容、不提交", compact)
+        self.assertIn("向当前已聚焦的输入框输入文本", compact)
         self.assertIn("# Action Space", compact)
         self.assertIn(
             "你是一个单步 GUI Agent，根据当前截图和用户指令选择一个动作。",
@@ -1964,7 +1964,10 @@ class ArtifactTests(unittest.TestCase):
             saved = paths.prompt.read_text(encoding="utf-8")
             self.assertEqual(saved, expected)
             self.assertIn('"action":"player_search"', saved)
-            self.assertIn('"action":"动作名称"', saved)
+            self.assertIn(
+                '{"action":"player_search","query":"搜索词"}',
+                saved,
+            )
             self.assertNotIn('"additionalProperties"', saved)
 
             model_content = (
