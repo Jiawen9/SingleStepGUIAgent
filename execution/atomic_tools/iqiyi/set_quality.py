@@ -296,7 +296,6 @@ def find_quality_option(root, quality: str):
 def rejection_payload(*, stage: str, quality: str, message: str) -> dict:
     return {
         "source": "atomic_tool",
-        "reason_type": "TARGET_NOT_VISIBLE",
         "stage": stage,
         "requested_quality": quality,
         "message": message,

@@ -88,10 +88,10 @@ class EvaluationReportToolTests(unittest.TestCase):
         )
 
     def test_action_name_accepts_reject(self):
-        self.assertEqual(action_name({"action_id": "reject"}), "reject")
+        self.assertEqual(action_name({"action": "reject"}), "reject")
         self.assertEqual(
-            action_summary({"action_id": "reject", "reason_type": "TARGET_NOT_VISIBLE"}),
-            '{"action_id":"reject","reason_type":"TARGET_NOT_VISIBLE"}',
+            action_summary({"action": "reject"}),
+            '{"action":"reject"}',
         )
 
     def test_engine_actions_reads_multi_engine_union(self):

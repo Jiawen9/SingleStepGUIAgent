@@ -348,7 +348,6 @@ def find_episode_card(root, episode_number: int):
 def rejection_payload(*, stage: str, direction: str, message: str) -> dict:
     return {
         "source": "atomic_tool",
-        "reason_type": "TARGET_NOT_VISIBLE",
         "stage": stage,
         "direction": direction,
         "message": message,

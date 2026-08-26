@@ -166,7 +166,6 @@ def progress_start_coordinates(progress_bar) -> tuple[int, int]:
 def rejection_payload(*, stage: str, message: str) -> dict:
     return {
         "source": "atomic_tool",
-        "reason_type": "TARGET_NOT_VISIBLE",
         "stage": stage,
         "message": message,
     }

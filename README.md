@@ -176,7 +176,7 @@ VLA 只返回一个扁平 JSON 动作，不使用 API function calling。
 拒绝动作：
 
 ```json
-{"action_id":"reject","reason_type":"拒绝类型"}
+{"action":"reject"}
 ```
 
 网易云音乐包名 `com.netease.cloudmusic.iot` 会额外加载搜索动作协议：
@@ -221,10 +221,7 @@ VLA 只返回一个扁平 JSON 动作，不使用 API function calling。
 
 允许的倍速为 `0.5x`、`0.75x`、`1.0x`、`1.25x`、`1.5x`。当前只提供 Prompt、动作目录和参数校验，尚未实现组合工具。
 
-`reason_type` 只允许：
-
-- `TARGET_NOT_VISIBLE`：目标或执行动作所需的状态不可见。
-- `UNSUPPORTED_TARGET`：用户提出的目标不受当前场景支持。
+以下两种情况都使用无参数的 `{"action":"reject"}`：目标或执行所需状态在当前截图中不可见、无法可靠确认；或者动作空间中没有一个动作能独立完成用户的完整意图。拒绝输出不携带原因分类。
 
 所有动作都会在本地完成参数白名单和范围校验后再转换为执行命令。
 

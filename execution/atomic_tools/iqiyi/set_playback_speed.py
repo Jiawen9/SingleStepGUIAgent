@@ -239,7 +239,6 @@ def find_speed_option(root, speed: str):
 def rejection_payload(*, stage: str, speed: str, message: str) -> dict:
     return {
         "source": "atomic_tool",
-        "reason_type": "TARGET_NOT_VISIBLE",
         "stage": stage,
         "requested_speed": speed,
         "message": message,

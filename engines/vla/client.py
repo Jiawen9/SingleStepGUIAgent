@@ -52,11 +52,21 @@ BASE_SYSTEM_PROMPT = """# 角色与任务
 - {"action":"swipe","start_coordinate":[x,y],"direction":"up","distance":"medium"}: 从指定起点按方向和距离滑动。direction 只能是 up、down、left、right，表示手指实际移动方向；distance 只能是 short、medium、long。
 
 ## 拒绝动作
-- {"action_id":"reject","reason_type":"拒绝类型"}: 无法可靠执行时拒绝；目标或完成动作所需的状态不可见时使用 TARGET_NOT_VISIBLE；用户提出的目标不受当前场景支持时使用 UNSUPPORTED_TARGET。"""
+- {"action":"reject"}: 无法可靠执行时拒绝。"""
 
 # Compatibility name for code importing the common prompt constant. App
 # actions are deliberately not included until build_system_prompt() is called.
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
+
+REFUSAL_POLICY_PROMPT = """## 单步完成性与拒绝规则
+- 先判断 Action Space 中是否存在一个动作，能够独立完成用户的完整最终意图。只有答案明确为“是”时，才能选择该动作。
+- 禁止把用户的完整任务降级成一个看似有帮助的局部步骤。点击应用入口、搜索入口、内容卡片或任意猜测坐标，如果执行后仍需后续动作才能完成最终意图，都必须 reject。
+- 第一种必须拒绝的情况：用户要求的目标或完成动作所需的状态在当前截图中不可见、不能唯一定位或无法可靠确认。此时禁止猜测坐标。
+- 第二种必须拒绝的情况：Action Space 中没有一个动作能独立完成用户的完整意图，包括多步骤任务、当前场景不支持的目标，以及只能完成局部步骤的情况。
+- 用户指令包含多个操作目标时，不得只执行其中一个，也不得擅自改写为更容易的目标。
+- `player_search` 只完成搜索，不等于播放搜索结果；`click` 只完成一次点击，不等于完成“打开应用并播放指定内容”等端到端任务。
+- 普通点击仅在用户要求点击一个当前截图中明确可见、可唯一定位的目标时使用。不要因为某个可见元素与指令部分相关就点击它。
+- 两种拒绝情况都只输出 {"action":"reject"}，不输出拒绝原因、解释或其他字段。"""
 
 class ApiError(RuntimeError):
     """Raised when the model endpoint cannot produce one valid action."""
@@ -184,12 +194,13 @@ def build_system_prompt(app_package: str | None = None) -> str:
     """Build the common prompt plus actions for the detected foreground App."""
     app_prompt = load_app_prompt(app_package)
     if app_prompt is None:
-        return BASE_SYSTEM_PROMPT
+        return f"{BASE_SYSTEM_PROMPT}\n\n{REFUSAL_POLICY_PROMPT}"
     reject_heading = "\n\n## 拒绝动作"
     prefix, separator, suffix = BASE_SYSTEM_PROMPT.partition(reject_heading)
     if not separator:
         raise RuntimeError("The base system prompt has no reject action section.")
-    return f"{prefix}\n\n{app_prompt.prompt}{separator}{suffix}"
+    prompt = f"{prefix}\n\n{app_prompt.prompt}{separator}{suffix}"
+    return f"{prompt}\n\n{REFUSAL_POLICY_PROMPT}"
 
 
 def build_user_prompt(instruction: str) -> str:
@@ -211,7 +222,7 @@ def parse_action_response(response: dict[str, Any]) -> ActionSelection:
     obj = _extract_json_object(content)
     if "action" in obj:
         action = obj.get("action")
-        if action in {"click", "type", "swipe"}:
+        if action in {"click", "type", "swipe", "reject"}:
             return _parse_basic_action(obj)
         if not isinstance(action, str) or not action:
             raise ApiError("The flat action JSON must contain a valid action name.")
@@ -220,19 +231,7 @@ def parse_action_response(response: dict[str, Any]) -> ActionSelection:
             {key: value for key, value in obj.items() if key != "action"},
             prompt_action=obj,
         )
-    name = obj.get("name", obj.get("action_id"))
-    if not isinstance(name, str):
-        raise ApiError("The model action JSON is malformed.")
-    if name != "reject":
-        raise ApiError(
-            f"Action {name!r} must use its flat JSON output format."
-        )
-    _require_object_keys(obj, {"action_id", "reason_type"})
-    return ActionSelection(
-        name,
-        {"reason_type": obj.get("reason_type")},
-        prompt_action=obj,
-    )
+    raise ApiError("The flat action JSON must contain an action field.")
 
 
 SWIPE_DISTANCE_UNITS = {
@@ -244,6 +243,9 @@ SWIPE_DISTANCE_UNITS = {
 
 def _parse_basic_action(obj: dict[str, Any]) -> ActionSelection:
     action = obj.get("action")
+    if action == "reject":
+        _require_object_keys(obj, {"action"})
+        return ActionSelection("reject", {}, prompt_action=obj)
     if action == "click":
         _require_object_keys(obj, {"action", "coordinate"})
         x, y = _coordinate_pair(obj.get("coordinate"), "coordinate")

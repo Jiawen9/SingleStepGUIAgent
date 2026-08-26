@@ -184,6 +184,9 @@ def compare_action(
     actual: ActionSelection | None,
     command,
 ) -> tuple[bool, str]:
+    # Evaluation workbooks may contain historical reject annotations using
+    # action_id/reason_type.  Keep them readable while runtime model output
+    # remains strict about the new {"action":"reject"} protocol.
     expected_name = expected.get("action") or expected.get("action_id")
     if not isinstance(expected_name, str) or not expected_name:
         raise ValueError("结果输出 must contain action or action_id.")
@@ -225,6 +228,15 @@ def compare_action(
             raise ValueError("type result must contain exactly action and text.")
         matches = actual.arguments.get("text") == expected["text"]
         return matches, "Type text matched." if matches else "Type text did not match."
+
+    if expected_name == "reject":
+        matches = actual.arguments == {}
+        return (
+            matches,
+            "Reject action matched."
+            if matches
+            else "Reject action must not contain parameters.",
+        )
 
     expected_arguments = {
         key: value for key, value in expected.items() if key not in {"action", "action_id"}

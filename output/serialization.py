@@ -29,5 +29,5 @@ def action_as_prompt_object(selection: ActionSelection) -> dict[str, Any]:
         distance = "short" if length <= 200 else "medium" if length <= 400 else "long"
         return {"action": "swipe", "start_coordinate": [x1, y1], "direction": direction, "distance": distance}
     if name == "reject":
-        return {"action_id": "reject", "reason_type": arguments["reason_type"]}
+        return {"action": "reject"}
     return {"action": name, **arguments}
