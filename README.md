@@ -137,7 +137,7 @@ python evaluator.py test.xlsx --engine-strategy parallel --vla-mode vla-basic --
 python evaluation_report_ttk.py test_result_20260819-120000.xlsx
 ```
 
-工具左侧显示截图，并以红色叠加标准结果、蓝色叠加模型像素动作；右侧列出每条单步指令、标准结果、模型结果和判定状态。报告应与 `device_captures` 目录位于同一级目录。
+工具左侧显示截图，并以红色叠加“期望结果”、蓝色叠加“系统像素动作”；右侧列出任务、`VLA正确` 和判分说明。报告应与 `device_captures` 目录位于同一级目录。
 
 结果默认保存为 `test_result_<时间戳>.xlsx`，包含原任务表、评测明细和总览。
 

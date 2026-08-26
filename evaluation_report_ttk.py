@@ -1,10 +1,13 @@
-"""Read-only TTK viewer for evaluator Excel reports."""
-
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import queue
+import re
 import sys
+import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,11 +17,14 @@ from typing import Any
 from openpyxl import load_workbook
 from PIL import Image, ImageTk
 
-
 DETAIL_SHEET = "评测明细"
-REQUIRED_COLUMNS = ("源行号", "任务指令", "图片ID", "期望结果", "系统标准动作")
+REQUIRED_COLUMNS = ("图片ID", "期望结果", "系统像素动作")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 RED = "#ff3b30"
 BLUE = "#1687ff"
+BG = "#202020"
+LIST_BATCH = 150
+REDRAW_DELAY_MS = 100
 
 
 @dataclass(frozen=True)
@@ -28,268 +34,550 @@ class ReportCase:
     instruction: str
     image_id: str
     expected_raw: str
-    model_raw: str
-    selected_engine: str
-    correct: bool
+    system_pixel_raw: str
+    vla_correct: bool | None
     comparison: str
     error: str
+
+
+def log(stage: str, message: str = "") -> None:
+    now = time.strftime("%H:%M:%S")
+    print(f"[{now}] [{stage}] {message}", flush=True)
 
 
 def cell_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
-def parse_action(raw: str) -> dict[str, Any] | None:
-    if not raw.strip():
+def parse_optional_bool(value: Any) -> bool | None:
+    if value is None or cell_text(value) == "":
         return None
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("动作必须是 JSON 对象。")
-    return value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    text = cell_text(value).casefold()
+    if text in {"true", "1", "yes", "y", "正确", "通过", "pass"}:
+        return True
+    if text in {"false", "0", "no", "n", "错误", "失败", "fail"}:
+        return False
+    return None
+
+
+def vla_result_text(value: bool | None) -> str:
+    if value is True:
+        return "正确"
+    if value is False:
+        return "错误"
+    return "未执行"
+
+
+def parse_expected_action(raw: str) -> dict[str, Any] | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    value: Any = None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        try:
+            value = ast.literal_eval(raw)
+        except Exception:
+            pass
+
+    if isinstance(value, dict):
+        if "action" in value or "action_id" in value:
+            return value
+        for key in ("expected", "expected_result", "target"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                return nested
+        if any(k in value for k in ("bbox", "box", "coordinate")):
+            result = dict(value)
+            result.setdefault("action", "click")
+            if "box" in result and "bbox" not in result:
+                result["bbox"] = result["box"]
+            return result
+
+    if isinstance(value, (list, tuple)):
+        if len(value) == 4 and all(isinstance(x, (int, float)) for x in value):
+            return {"action": "click", "bbox": list(value)}
+        if len(value) == 2 and all(isinstance(x, (int, float)) for x in value):
+            return {"action": "click", "coordinate": list(value)}
+
+    m = re.search(
+        r"(?:bbox|box|bounds)?\s*[:=]?\s*"
+        r"[\[\(]\s*(-?\d+(?:\.\d+)?)\s*,\s*"
+        r"(-?\d+(?:\.\d+)?)\s*,\s*"
+        r"(-?\d+(?:\.\d+)?)\s*,\s*"
+        r"(-?\d+(?:\.\d+)?)\s*[\]\)]",
+        raw,
+        re.I,
+    )
+    if m:
+        return {"action": "click", "bbox": [float(m.group(i)) for i in range(1, 5)]}
+
+    m = re.search(
+        r"(?:coordinate|point|click)\s*[:=]?\s*"
+        r"[\[\(]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*[\]\)]",
+        raw,
+        re.I,
+    )
+    if m:
+        return {"action": "click", "coordinate": [float(m.group(1)), float(m.group(2))]}
+
+    raise ValueError(f"无法解析期望结果：{raw}")
 
 
 def action_name(action: dict[str, Any] | None) -> str:
-    if action is None:
-        return "无"
-    return str(action.get("action") or action.get("action_id") or "未知")
+    if not action:
+        return ""
+    return str(action.get("action") or action.get("action_id") or "click")
 
 
-def engine_actions(raw: str) -> list[tuple[str, dict[str, Any]]]:
-    value = parse_action(raw)
-    if value is None:
+def parse_system_actions(raw: str) -> list[tuple[str, dict[str, Any]]]:
+    """
+    解析“系统像素动作”。
+
+    支持：
+    1. 单动作：
+       {"action":"click","coordinate":[100,200]}
+
+    2. 多 engine：
+       {
+         "ocr":{"action":"click","coordinate":[100,200]},
+         "vla":{"action":"click","bbox":[[10,20,30,40]]}
+       }
+
+    返回：
+        [("", action)]
+    或：
+        [("ocr", action1), ("vla", action2)]
+    """
+    raw = raw.strip()
+    if not raw:
         return []
+
+    value: Any = None
+    try:
+        value = json.loads(raw)
+    except Exception:
+        try:
+            value = ast.literal_eval(raw)
+        except Exception as exc:
+            raise ValueError(f"无法解析系统像素动作：{raw}") from exc
+
+    if not isinstance(value, dict):
+        raise ValueError("系统像素动作必须是 JSON/dict 对象。")
+
     if "action" in value or "action_id" in value:
-        return [("模型", value)]
-    actions = []
+        return [("", value)]
+
+    actions: list[tuple[str, dict[str, Any]]] = []
     for engine, action in value.items():
-        if isinstance(action, dict) and ("action" in action or "action_id" in action):
-            actions.append((str(engine), action))
+        if isinstance(action, dict) and (
+            "action" in action
+            or "action_id" in action
+            or any(k in action for k in ("bbox", "box", "coordinate", "start_coordinate"))
+        ):
+            normalized = dict(action)
+            if "action" not in normalized and "action_id" not in normalized:
+                if "start_coordinate" in normalized:
+                    normalized["action"] = "swipe"
+                else:
+                    normalized["action"] = "click"
+            actions.append((str(engine), normalized))
+
+    if not actions:
+        raise ValueError(f"系统像素动作中未找到可绘制动作：{raw}")
+
     return actions
 
 
-def compact_action(raw: str) -> str:
+def resolve_report_image(image_id: str, report_dir: Path, image_root: Path | None) -> Path:
+    raw = image_id.strip()
+    if not raw:
+        raise FileNotFoundError("当前条目的图片ID为空。")
+
+    value = Path(raw).expanduser()
+    bases: list[Path] = []
+    if value.is_absolute():
+        bases.append(value)
+    else:
+        if image_root is not None:
+            bases.append(image_root / value)
+        bases.append(report_dir / value)
+        bases.append(report_dir / "device_captures" / value)
+
+    for base in bases:
+        candidates = [base]
+        if not base.suffix:
+            candidates += [base.with_suffix(ext) for ext in IMAGE_EXTENSIONS]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate.resolve()
+    raise FileNotFoundError(f"未找到图片：{image_id}")
+
+
+def load_report_worker(path: Path, out: queue.Queue) -> None:
+    """后台线程：只解析 Excel，不调用任何 Tk API。"""
     try:
-        value = parse_action(raw)
-        return "" if value is None else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    except (ValueError, json.JSONDecodeError):
-        return raw
+        log("EXCEL_LOAD_START", str(path))
+        started = time.perf_counter()
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if DETAIL_SHEET not in wb.sheetnames:
+                raise ValueError(f"评测报告中没有“{DETAIL_SHEET}”工作表。")
+            ws = wb[DETAIL_SHEET]
+            rows = ws.iter_rows(values_only=True)
+            try:
+                header_row = next(rows)
+            except StopIteration:
+                raise ValueError("评测明细为空。")
 
+            header_values = [cell_text(x) for x in header_row]
+            headers = {name: i for i, name in enumerate(header_values) if name}
+            missing = [name for name in REQUIRED_COLUMNS if name not in headers]
+            if missing:
+                raise ValueError("评测明细缺少列：" + "、".join(missing))
 
-def action_summary(action: dict[str, Any]) -> str:
-    return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
+            def get(row: tuple[Any, ...], name: str, default: Any = None) -> Any:
+                idx = headers.get(name)
+                return default if idx is None or idx >= len(row) else row[idx]
 
-
-def resolve_report_image(image_id: str, report_dir: Path) -> Path:
-    value = Path(image_id).expanduser()
-    candidate = value if value.is_absolute() else report_dir / "device_captures" / value
-    candidate = candidate.resolve()
-    if not candidate.is_file():
-        raise FileNotFoundError(f"未找到图片：{candidate}")
-    return candidate
-
-
-def load_report(path: Path) -> list[ReportCase]:
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    try:
-        if DETAIL_SHEET not in workbook.sheetnames:
-            raise ValueError(f"评测报告中没有 {DETAIL_SHEET!r} 工作表。")
-        sheet = workbook[DETAIL_SHEET]
-        headers = {cell_text(cell.value): cell.column for cell in sheet[1]}
-        missing = [column for column in REQUIRED_COLUMNS if column not in headers]
-        if missing:
-            raise ValueError("评测明细缺少列：" + "、".join(missing))
-
-        cases: list[ReportCase] = []
-        for row in range(2, sheet.max_row + 1):
-            instruction = cell_text(sheet.cell(row, headers["任务指令"]).value)
-            image_id = cell_text(sheet.cell(row, headers["图片ID"]).value)
-            if not instruction and not image_id:
-                continue
-            pixel_column = headers.get("系统像素动作")
-            standard_column = headers["系统标准动作"]
-            model_raw = cell_text(
-                sheet.cell(row, pixel_column or standard_column).value
-            )
-            if not model_raw and pixel_column:
-                model_raw = cell_text(sheet.cell(row, standard_column).value)
-            correct_value = sheet.cell(row, headers.get("是否正确", 0)).value if "是否正确" in headers else False
-            source_value = sheet.cell(row, headers["源行号"]).value
-            cases.append(
-                ReportCase(
-                    row,
-                    int(source_value) if isinstance(source_value, (int, float)) else row,
-                    instruction,
-                    image_id,
-                    cell_text(sheet.cell(row, headers["期望结果"]).value),
-                    model_raw,
-                    cell_text(sheet.cell(row, headers.get("执行主体", 0)).value) if "执行主体" in headers else "",
-                    bool(correct_value),
-                    cell_text(sheet.cell(row, headers.get("判分说明", 0)).value) if "判分说明" in headers else "",
-                    cell_text(sheet.cell(row, headers.get("错误", 0)).value) if "错误" in headers else "",
+            cases: list[ReportCase] = []
+            for report_row, values in enumerate(rows, start=2):
+                image_id = cell_text(get(values, "图片ID"))
+                instruction = cell_text(get(values, "任务指令"))
+                if not image_id and not instruction:
+                    continue
+                source_value = get(values, "源行号", report_row)
+                source_row = int(source_value) if isinstance(source_value, (int, float)) else report_row
+                cases.append(
+                    ReportCase(
+                        report_row=report_row,
+                        source_row=source_row,
+                        instruction=instruction,
+                        image_id=image_id,
+                        expected_raw=cell_text(get(values, "期望结果")),
+                        system_pixel_raw=cell_text(get(values, "系统像素动作")),
+                        vla_correct=parse_optional_bool(get(values, "VLA正确")),
+                        comparison=cell_text(get(values, "判分说明")),
+                        error=cell_text(get(values, "错误")),
+                    )
                 )
-            )
-        if not cases:
-            raise ValueError("评测明细中没有可查看的用例。")
-        return cases
-    finally:
-        workbook.close()
+                if len(cases) % 1000 == 0:
+                    out.put(("excel_progress", len(cases)))
+
+            if not cases:
+                raise ValueError("评测明细中没有可查看的用例。")
+        finally:
+            wb.close()
+
+        elapsed = time.perf_counter() - started
+        log("EXCEL_LOAD_DONE", f"{len(cases)} rows, {elapsed:.2f}s")
+        out.put(("excel_done", cases))
+    except Exception as e:
+        log("EXCEL_LOAD_ERROR", repr(e))
+        out.put(("excel_error", e))
+
+
+def load_image_worker(
+    request_id: int,
+    index: int,
+    case: ReportCase,
+    report_dir: Path,
+    image_root: Path | None,
+    out: queue.Queue,
+) -> None:
+    """后台线程：解析期望结果、读取图片、转 RGB；不创建 ImageTk.PhotoImage。"""
+    try:
+        log("IMAGE_LOAD_START", f"index={index}, id={case.image_id}")
+        started = time.perf_counter()
+        errors: list[str] = []
+        try:
+            expected = parse_expected_action(case.expected_raw)
+        except Exception as e:
+            expected = None
+            errors.append(str(e))
+
+        try:
+            system_actions = parse_system_actions(case.system_pixel_raw)
+        except Exception as e:
+            system_actions = []
+            errors.append(str(e))
+
+        image: Image.Image | None = None
+        image_path: Path | None = None
+        try:
+            image_path = resolve_report_image(case.image_id, report_dir, image_root)
+            with Image.open(image_path) as src:
+                src.load()
+                image = src.convert("RGB")
+        except Exception as e:
+            errors.append(str(e))
+
+        if case.error:
+            errors.append(f"评测记录错误：{case.error}")
+
+        elapsed = time.perf_counter() - started
+        log("IMAGE_LOAD_DONE", f"index={index}, {elapsed:.2f}s")
+        out.put((
+            "image_done",
+            request_id,
+            index,
+            image,
+            expected,
+            system_actions,
+            errors,
+            image_path,
+        ))
+    except Exception as e:
+        log("IMAGE_LOAD_ERROR", repr(e))
+        out.put(("image_error", request_id, index, e))
 
 
 def swipe_end(action: dict[str, Any], width: int, height: int) -> tuple[float, float] | None:
     end = action.get("end_coordinate")
-    if isinstance(end, list) and len(end) == 2:
+    if isinstance(end, (list, tuple)) and len(end) == 2:
         return float(end[0]), float(end[1])
     start = action.get("start_coordinate")
     direction = action.get("direction")
-    if not isinstance(start, list) or len(start) != 2 or direction not in {"up", "down", "left", "right"}:
+    if not isinstance(start, (list, tuple)) or len(start) != 2:
         return None
-    fraction = {"short": 0.15, "medium": 0.3, "long": 0.55}.get(action.get("distance"), 0.3)
+    if direction not in {"up", "down", "left", "right"}:
+        return None
+    fraction = {"short": .15, "medium": .30, "long": .55}.get(action.get("distance"), .30)
     x, y = float(start[0]), float(start[1])
-    if direction == "left":
-        x -= width * fraction
-    elif direction == "right":
-        x += width * fraction
-    elif direction == "up":
-        y -= height * fraction
-    else:
-        y += height * fraction
+    if direction == "left": x -= width * fraction
+    elif direction == "right": x += width * fraction
+    elif direction == "up": y -= height * fraction
+    else: y += height * fraction
     return max(0, min(width - 1, x)), max(0, min(height - 1, y))
 
 
 class OverlayCanvas(tk.Canvas):
     def __init__(self, master):
-        super().__init__(master, bg="#202020", highlightthickness=0)
+        super().__init__(master, bg=BG, highlightthickness=0)
         self.image: Image.Image | None = None
-        self.photo = None
+        self.photo: ImageTk.PhotoImage | None = None
         self.expected: dict[str, Any] | None = None
-        self.model: list[tuple[str, dict[str, Any]]] = []
+        self.system_actions: list[tuple[str, dict[str, Any]]] = []
         self.scale = 1.0
-        self.offset_x = self.offset_y = 0
-        self.bind("<Configure>", lambda _event: self.redraw())
+        self.ox = self.oy = 0
+        self._redraw_job: str | None = None
+        self._last_size: tuple[int, int] | None = None
+        self.bind("<Configure>", self._on_configure)
 
-    def configure_case(self, image, expected, model):
+    def _on_configure(self, _event=None):
+        # 窗口尺寸变化会连续触发很多 Configure；只重绘最后一次。
+        if self._redraw_job is not None:
+            try:
+                self.after_cancel(self._redraw_job)
+            except Exception:
+                pass
+        self._redraw_job = self.after(REDRAW_DELAY_MS, self.redraw)
+
+    def set_message(self, text: str):
+        self.image = None
+        self.expected = None
+        self.system_actions = []
+        self.photo = None
+        self.delete("all")
+        w, h = max(1, self.winfo_width()), max(1, self.winfo_height())
+        self.create_text(w / 2, h / 2, text=text, fill="white", font=("TkDefaultFont", 15))
+
+    def configure_case(
+        self,
+        image: Image.Image | None,
+        expected: dict[str, Any] | None,
+        system_actions: list[tuple[str, dict[str, Any]]] | None = None,
+    ):
         self.image = image
         self.expected = expected
-        self.model = model
+        self.system_actions = list(system_actions or [])
         self.redraw()
 
-    def canvas_point(self, point):
-        return (
-            self.offset_x + float(point[0]) * self.scale,
-            self.offset_y + float(point[1]) * self.scale,
-        )
+    def cp(self, point):
+        return self.ox + float(point[0]) * self.scale, self.oy + float(point[1]) * self.scale
 
-    def draw_action(self, action, color, label):
+    def draw_action(self, action: dict[str, Any] | None, color: str, label: str):
         if not action or self.image is None:
             return
-        name = action_name(action)
-        if name == "click":
-            boxes = action.get("bbox")
-            if isinstance(boxes, list) and len(boxes) == 4 and all(
-                isinstance(value, (int, float)) for value in boxes
-            ):
-                boxes = [boxes]
-            if isinstance(boxes, list):
-                for box in boxes:
-                    if isinstance(box, list) and len(box) == 4:
-                        start = self.canvas_point(box[:2])
-                        end = self.canvas_point(box[2:])
-                        self.create_rectangle(*start, *end, outline=color, width=3)
-                        self.create_text(start[0] + 4, start[1] + 4, text=label, fill=color, anchor="nw", font=("TkDefaultFont", 10, "bold"))
-            coordinate = action.get("coordinate")
-            if coordinate is None and all(key in action for key in ("x", "y")):
-                coordinate = [action["x"], action["y"]]
-            if isinstance(coordinate, list) and len(coordinate) == 2:
-                x, y = self.canvas_point(coordinate)
-                radius = 8
-                self.create_oval(x-radius, y-radius, x+radius, y+radius, outline=color, width=3)
-                self.create_line(x-radius-4, y, x+radius+4, y, fill=color, width=2)
-                self.create_line(x, y-radius-4, x, y+radius+4, fill=color, width=2)
-                self.create_text(x + 11, y + 11, text=label, fill=color, anchor="nw", font=("TkDefaultFont", 10, "bold"))
-        elif name == "swipe":
+
+        name = action_name(action).casefold()
+
+        if name == "swipe":
             start = action.get("start_coordinate")
             end = swipe_end(action, self.image.width, self.image.height)
-            if isinstance(start, list) and len(start) == 2 and end is not None:
-                a, z = self.canvas_point(start), self.canvas_point(end)
-                self.create_line(*a, *z, fill=color, width=4, arrow=tk.LAST, arrowshape=(14, 18, 7))
-                self.create_text(a[0] + 4, a[1] + 4, text=label, fill=color, anchor="nw", font=("TkDefaultFont", 10, "bold"))
-
-    def draw_action_labels(self, width: int, height: int):
-        entries = []
-        if self.expected:
-            entries.append((RED, "标准", self.expected))
-        entries.extend((BLUE, f"模型-{engine}", action) for engine, action in self.model)
-        if not entries:
+            if isinstance(start, (list, tuple)) and len(start) == 2 and end is not None:
+                a, z = self.cp(start), self.cp(end)
+                self.create_line(
+                    *a, *z,
+                    fill=color,
+                    width=4,
+                    arrow=tk.LAST,
+                    arrowshape=(14, 18, 7),
+                )
+                self.create_text(
+                    a[0] + 5,
+                    a[1] + 5,
+                    text=label,
+                    fill=color,
+                    anchor="nw",
+                    font=("TkDefaultFont", 10, "bold"),
+                )
             return
-        line_height = 24
-        panel_height = min(height - 12, 12 + line_height * len(entries))
-        top = height - panel_height
-        self.create_rectangle(8, top, width - 8, height - 8, fill="#151515", outline="#555555", width=1)
-        for index, (color, label, action) in enumerate(entries):
-            y = top + 8 + index * line_height
-            text = f"{label}: {action_summary(action)}"
+
+        boxes = action.get("bbox", action.get("box"))
+
+        # bbox: [x1,y1,x2,y2]
+        if (
+            isinstance(boxes, (list, tuple))
+            and len(boxes) == 4
+            and all(isinstance(v, (int, float)) for v in boxes)
+        ):
+            boxes = [boxes]
+
+        # bbox: [[x1,y1,x2,y2], ...]
+        if isinstance(boxes, (list, tuple)):
+            for box in boxes:
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    a, z = self.cp(box[:2]), self.cp(box[2:])
+                    self.create_rectangle(
+                        *a, *z,
+                        outline=color,
+                        width=4,
+                    )
+                    self.create_text(
+                        a[0] + 5,
+                        a[1] + 5,
+                        text=label,
+                        fill=color,
+                        anchor="nw",
+                        font=("TkDefaultFont", 10, "bold"),
+                    )
+
+        coordinate = action.get("coordinate")
+        if coordinate is None and all(k in action for k in ("x", "y")):
+            coordinate = [action["x"], action["y"]]
+
+        if isinstance(coordinate, (list, tuple)) and len(coordinate) == 2:
+            x, y = self.cp(coordinate)
+            r = 9
+            self.create_oval(
+                x-r, y-r, x+r, y+r,
+                outline=color,
+                width=4,
+            )
+            self.create_line(
+                x-r-5, y, x+r+5, y,
+                fill=color,
+                width=2,
+            )
+            self.create_line(
+                x, y-r-5, x, y+r+5,
+                fill=color,
+                width=2,
+            )
             self.create_text(
-                16, y, text=text, fill=color, anchor="nw",
-                width=max(100, width - 32), font=("TkDefaultFont", 10, "bold"),
+                x + 12,
+                y + 12,
+                text=label,
+                fill=color,
+                anchor="nw",
+                font=("TkDefaultFont", 10, "bold"),
             )
 
+    def draw_expected(self):
+        self.draw_action(self.expected, RED, "期望结果")
+
+    def draw_system_actions(self):
+        for engine, action in self.system_actions:
+            label = "系统像素动作"
+            if engine:
+                label += f"-{engine.upper()}"
+            self.draw_action(action, BLUE, label)
+
     def redraw(self):
-        self.delete("all")
-        width, height = max(1, self.winfo_width()), max(1, self.winfo_height())
+        self._redraw_job = None
+        w, h = max(1, self.winfo_width()), max(1, self.winfo_height())
         if self.image is None:
-            self.create_text(width / 2, height / 2, text="无法显示图片", fill="white")
+            self.set_message("请选择右侧条目加载图片")
             return
-        self.scale = min(width / self.image.width, height / self.image.height)
+
+        size_key = (w, h)
+        log("CANVAS_DRAW", f"canvas={w}x{h}, image={self.image.width}x{self.image.height}")
+        self.delete("all")
+        self.scale = min(w / self.image.width, h / self.image.height)
         shown_size = (
             max(1, round(self.image.width * self.scale)),
             max(1, round(self.image.height * self.scale)),
         )
-        shown = self.image.resize(shown_size, Image.Resampling.LANCZOS)
-        self.offset_x = (width - shown_size[0]) // 2
-        self.offset_y = (height - shown_size[1]) // 2
+        # BILINEAR 比 LANCZOS 快很多，查看器足够清晰，也更不容易阻塞 GUI。
+        shown = self.image.resize(shown_size, Image.Resampling.BILINEAR)
+        self.ox = (w - shown_size[0]) // 2
+        self.oy = (h - shown_size[1]) // 2
         self.photo = ImageTk.PhotoImage(shown)
-        self.create_image(self.offset_x, self.offset_y, image=self.photo, anchor="nw")
-        self.draw_action(self.expected, RED, "标准")
-        for engine, action in self.model:
-            self.draw_action(action, BLUE, f"模型-{engine}")
-        self.create_rectangle(10, 10, 245, 42, fill="#202020", outline="")
-        self.create_text(18, 26, text="■ 标准结果    ■ 模型结果", fill="white", anchor="w")
+        self.create_image(self.ox, self.oy, image=self.photo, anchor="nw")
+        self.draw_expected()
+        self.draw_system_actions()
+
+        # 图例
+        self.create_rectangle(10, 10, 320, 42, fill=BG, outline="")
         self.create_rectangle(18, 19, 29, 30, fill=RED, outline=RED)
-        self.create_rectangle(113, 19, 124, 30, fill=BLUE, outline=BLUE)
-        self.draw_action_labels(width, height)
+        self.create_text(38, 26, text="期望结果", fill="white", anchor="w")
+        self.create_rectangle(121, 19, 132, 30, fill=BLUE, outline=BLUE)
+        self.create_text(141, 26, text="系统像素动作", fill="white", anchor="w")
+
+        self._last_size = size_key
 
 
-class ReportViewer:
+class ViewerApp:
     def __init__(self, root: tk.Tk, report_path: Path):
         self.root = root
         self.report_path = report_path.resolve()
-        self.cases = load_report(self.report_path)
-        self.index = 0
+        self.report_dir = self.report_path.parent
+        self.image_root: Path | None = None
+        self.cases: list[ReportCase] = []
+        self.index = -1
         self.selecting = False
-        self.progress = tk.StringVar()
-        self.status = tk.StringVar()
-        self.instruction = tk.StringVar()
-        self.expected_text = tk.StringVar()
-        self.model_text = tk.StringVar()
-        self.meta_text = tk.StringVar()
-        root.title(f"评测结果只读检查（红=标准，蓝=模型）- {self.report_path.name}")
-        root.geometry("1600x920")
-        root.minsize(1100, 700)
+        self.image_request_id = 0
+        # 防止同一条记录因为重复 UI 事件被并发加载多次。
+        # key = (index, image_root_string)
+        self.loading_image_key = None
+        self.q: queue.Queue = queue.Queue()
+        self.progress = tk.StringVar(value="正在读取 Excel...")
+        self.status = tk.StringVar(value="初始化")
+        self.instruction = tk.StringVar(value="未选择")
+        self.image_id_var = tk.StringVar(value="未选择")
+        self.expected_var = tk.StringVar(value="未选择")
+        self.system_pixel_var = tk.StringVar(value="未选择")
+        self.vla_result = tk.StringVar(value="未选择")
+        self.comparison = tk.StringVar(value="未选择")
+
+        root.title(f"评测结果查看器 - {self.report_path.name}")
+        root.geometry("1500x900")
+        root.minsize(1000, 650)
         self.build()
-        root.bind("<Left>", lambda _event: self.navigate(-1))
-        root.bind("<Right>", lambda _event: self.navigate(1))
-        self.show_case(0)
+        root.bind("<Left>", lambda _e: self.navigate(-1))
+        root.bind("<Right>", lambda _e: self.navigate(1))
+        self.start_excel_load()
+        self.root.after(50, self.poll_queue)
 
     def build(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
-        toolbar = ttk.Frame(self.root, padding=8)
-        toolbar.grid(row=0, column=0, sticky="ew")
-        ttk.Button(toolbar, text="上一条", command=lambda: self.navigate(-1)).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="下一条", command=lambda: self.navigate(1)).pack(side=tk.LEFT, padx=6)
-        ttk.Label(toolbar, textvariable=self.progress).pack(side=tk.LEFT, padx=12)
-        ttk.Label(toolbar, text="红色：标准结果", foreground=RED).pack(side=tk.RIGHT, padx=8)
-        ttk.Label(toolbar, text="蓝色：模型结果", foreground=BLUE).pack(side=tk.RIGHT)
+
+        top = ttk.Frame(self.root, padding=8)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Button(top, text="上一条", command=lambda: self.navigate(-1)).pack(side=tk.LEFT)
+        ttk.Button(top, text="下一条", command=lambda: self.navigate(1)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="选择图片目录", command=self.choose_image_root).pack(side=tk.LEFT, padx=(14, 6))
+        ttk.Label(top, textvariable=self.progress).pack(side=tk.LEFT, padx=12)
+        ttk.Label(top, text="红色：期望结果", foreground=RED).pack(side=tk.RIGHT, padx=8)
+        ttk.Label(top, text="蓝色：系统像素动作", foreground=BLUE).pack(side=tk.RIGHT)
 
         panes = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         panes.grid(row=1, column=0, sticky="nsew", padx=8)
@@ -297,129 +585,232 @@ class ReportViewer:
         right = ttk.Frame(panes, padding=(8, 0, 0, 0))
         panes.add(left, weight=3)
         panes.add(right, weight=2)
+
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
         self.canvas = OverlayCanvas(left)
         self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.set_message("正在读取 Excel 条目...")
 
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=3)
         right.rowconfigure(1, weight=2)
-        columns = ("row", "instruction", "expected", "model", "result")
-        self.case_list = ttk.Treeview(right, columns=columns, show="headings", selectmode="browse")
-        headings = {"row": "行", "instruction": "单步指令", "expected": "标准结果", "model": "模型结果", "result": "判定"}
-        widths = {"row": 48, "instruction": 220, "expected": 190, "model": 190, "result": 58}
-        for column in columns:
-            self.case_list.heading(column, text=headings[column])
-            self.case_list.column(column, width=widths[column], anchor="w")
-        scrollbar = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.case_list.yview)
-        self.case_list.configure(yscrollcommand=scrollbar.set)
-        self.case_list.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        for index, case in enumerate(self.cases):
-            result = "错误" if case.error else ("正确" if case.correct else "错误")
-            self.case_list.insert("", tk.END, iid=str(index), values=(
-                case.source_row,
-                case.instruction,
-                compact_action(case.expected_raw),
-                compact_action(case.model_raw),
-                result,
-            ))
-        self.case_list.tag_configure("incorrect", foreground="#c62828")
-        self.case_list.bind("<<TreeviewSelect>>", self.on_select)
+        cols = ("row", "instruction", "image", "vla")
+        self.tree = ttk.Treeview(right, columns=cols, show="headings", selectmode="browse")
+        for col, title, width in (
+            ("row", "行", 55),
+            ("instruction", "任务", 260),
+            ("image", "图片ID", 190),
+            ("vla", "VLA正确", 80),
+        ):
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor="w")
+        scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
 
         detail = ttk.LabelFrame(right, text="当前用例详情", padding=8)
         detail.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         detail.columnconfigure(1, weight=1)
-        fields = (
-            ("单步指令", self.instruction),
-            ("标准结果（红）", self.expected_text),
-            ("模型结果（蓝）", self.model_text),
-            ("判定信息", self.meta_text),
-        )
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(detail, text=label + "：").grid(row=row, column=0, sticky="nw", pady=3)
-            ttk.Label(detail, textvariable=variable, wraplength=560, justify=tk.LEFT).grid(row=row, column=1, sticky="nw", pady=3)
+        for r, (name, var) in enumerate((
+            ("任务", self.instruction),
+            ("图片ID", self.image_id_var),
+            ("期望结果", self.expected_var),
+            ("系统像素动作", self.system_pixel_var),
+            ("VLA正确", self.vla_result),
+            ("判分说明", self.comparison),
+        )):
+            ttk.Label(detail, text=name + "：").grid(row=r, column=0, sticky="nw", pady=3)
+            ttk.Label(detail, textvariable=var, wraplength=520, justify=tk.LEFT).grid(row=r, column=1, sticky="nw", pady=3)
+
         ttk.Label(self.root, textvariable=self.status, anchor="w", relief="sunken", padding=(6, 3)).grid(row=2, column=0, sticky="ew", pady=(8, 0))
 
+    def start_excel_load(self):
+        threading.Thread(target=load_report_worker, args=(self.report_path, self.q), daemon=True).start()
+
+    def poll_queue(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                kind = item[0]
+                if kind == "excel_progress":
+                    self.progress.set(f"已读取 {item[1]} 条...")
+                elif kind == "excel_done":
+                    self.cases = item[1]
+                    self.progress.set(f"共 {len(self.cases)} 条，正在构建列表...")
+                    log("LIST_BUILD_START", str(len(self.cases)))
+                    self._insert_batch(0)
+                elif kind == "excel_error":
+                    messagebox.showerror("Excel 读取失败", str(item[1]), parent=self.root)
+                    self.status.set(str(item[1]))
+                elif kind == "image_done":
+                    (
+                        _,
+                        req_id,
+                        index,
+                        image,
+                        expected,
+                        system_actions,
+                        errors,
+                        image_path,
+                    ) = item
+                    if req_id != self.image_request_id or index != self.index:
+                        continue
+                    self.loading_image_key = None
+                    self.canvas.configure_case(image, expected, system_actions)
+                    self.status.set("；".join(errors) if errors else f"已加载：{image_path}")
+                elif kind == "image_error":
+                    _, req_id, index, error = item
+                    if req_id == self.image_request_id and index == self.index:
+                        self.loading_image_key = None
+                        self.canvas.set_message("图片加载失败")
+                        self.status.set(str(error))
+        except queue.Empty:
+            pass
+        self.root.after(50, self.poll_queue)
+
+    def _insert_batch(self, start: int):
+        end = min(start + LIST_BATCH, len(self.cases))
+        for i in range(start, end):
+            case = self.cases[i]
+            self.tree.insert("", tk.END, iid=str(i), values=(
+                case.source_row,
+                case.instruction,
+                case.image_id,
+                vla_result_text(case.vla_correct),
+            ))
+        self.progress.set(f"列表 {end}/{len(self.cases)}")
+        if end < len(self.cases):
+            self.root.after(1, lambda: self._insert_batch(end))
+        else:
+            log("LIST_BUILD_DONE", str(len(self.cases)))
+            self.progress.set(f"共 {len(self.cases)} 条记录")
+            self.status.set("条目加载完成；点击右侧条目后才加载对应图片")
+            self.canvas.set_message("请选择右侧条目加载图片")
+
+    def choose_image_root(self):
+        selected = filedialog.askdirectory(title="选择图片根目录", parent=self.root)
+        if selected:
+            self.image_root = Path(selected).resolve()
+            self.loading_image_key = None
+            self.status.set(f"图片目录：{self.image_root}")
+            if self.index >= 0:
+                self.load_selected_image(self.index)
+
+    def on_select(self, _event=None):
+        if self.selecting:
+            return
+        selected = self.tree.selection()
+        if not selected:
+            return
+
+        target = int(selected[0])
+
+        # selection_set() 会再次产生 <<TreeviewSelect>>。
+        # 如果还是当前条目，必须直接返回，避免事件递归。
+        if target == self.index:
+            return
+
+        self.show_case(target)
+
     def show_case(self, index: int):
+        if not (0 <= index < len(self.cases)):
+            return
         self.index = index
         case = self.cases[index]
-        self.progress.set(f"{index + 1}/{len(self.cases)}  Excel 源行：{case.source_row}  图片：{case.image_id}")
-        self.instruction.set(case.instruction)
-        self.expected_text.set(compact_action(case.expected_raw) or "无")
-        self.model_text.set(compact_action(case.model_raw) or "无")
-        self.meta_text.set(
-            f"{'ERROR' if case.error else ('PASS' if case.correct else 'FAIL')} | "
-            f"engine={case.selected_engine or '-'} | {case.error or case.comparison}"
-        )
-        errors = []
-        try:
-            expected = parse_action(case.expected_raw)
-        except (ValueError, json.JSONDecodeError) as error:
-            expected = None
-            errors.append(f"标准结果无法解析：{error}")
-        try:
-            model = engine_actions(case.model_raw)
-        except (ValueError, json.JSONDecodeError) as error:
-            model = []
-            errors.append(f"模型结果无法解析：{error}")
-        image = None
-        try:
-            with Image.open(resolve_report_image(case.image_id, self.report_path.parent)) as source:
-                source.load()
-                image = source.convert("RGB")
-        except OSError as error:
-            errors.append(str(error))
-        self.canvas.configure_case(image, expected, model)
-        self.status.set("；".join(errors) if errors else "已加载")
-        self.selecting = True
-        self.case_list.selection_set(str(index))
-        self.case_list.focus(str(index))
-        self.case_list.see(str(index))
-        self.selecting = False
+        self.progress.set(f"{index+1}/{len(self.cases)}  Excel 源行：{case.source_row}")
+        self.instruction.set(case.instruction or "无")
+        self.image_id_var.set(case.image_id or "无")
+        self.expected_var.set(case.expected_raw or "无")
+        self.system_pixel_var.set(case.system_pixel_raw or "无")
+        self.vla_result.set(vla_result_text(case.vla_correct))
+        self.comparison.set(case.comparison or "无")
+
+        current_selection = self.tree.selection()
+        if current_selection != (str(index),):
+            self.selecting = True
+            try:
+                self.tree.selection_set(str(index))
+                self.tree.focus(str(index))
+                self.tree.see(str(index))
+            finally:
+                self.selecting = False
+
+        self.load_selected_image(index)
+
+    def load_selected_image(self, index: int):
+        if not (0 <= index < len(self.cases)):
+            return
+
+        root_key = str(self.image_root) if self.image_root is not None else ""
+        load_key = (index, root_key)
+
+        # 同一条、同一图片目录如果已经在加载，禁止重复创建后台线程。
+        if self.loading_image_key == load_key:
+            log("IMAGE_LOAD_SKIP", f"duplicate index={index}")
+            return
+
+        self.loading_image_key = load_key
+        self.image_request_id += 1
+        req_id = self.image_request_id
+        case = self.cases[index]
+
+        self.status.set("正在后台加载当前图片...")
+        self.canvas.set_message("正在加载当前图片...")
+
+        threading.Thread(
+            target=load_image_worker,
+            args=(req_id, index, case, self.report_dir, self.image_root, self.q),
+            daemon=True,
+        ).start()
 
     def navigate(self, delta: int):
+        if not self.cases:
+            return
+        if self.index < 0:
+            if delta > 0:
+                self.show_case(0)
+            return
         target = self.index + delta
         if 0 <= target < len(self.cases):
             self.show_case(target)
         else:
             self.status.set("已经是第一条" if target < 0 else "已经是最后一条")
 
-    def on_select(self, _event=None):
-        if self.selecting:
-            return
-        selected = self.case_list.selection()
-        if selected:
-            self.show_case(int(selected[0]))
+
+def choose_report(root: tk.Tk) -> Path | None:
+    selected = filedialog.askopenfilename(
+        title="选择 evaluator 测试报告",
+        filetypes=(("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")),
+        parent=root,
+    )
+    return Path(selected) if selected else None
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="TTK evaluator report visual checker")
-    parser.add_argument("report", nargs="?", type=Path, help="Evaluator result .xlsx")
+    parser = argparse.ArgumentParser(description="Async TTK evaluator viewer")
+    parser.add_argument("report", nargs="?", type=Path)
     args = parser.parse_args(argv)
-    print("[REPORT] 正在初始化只读评测查看器...", flush=True)
-    root = tk.Tk()
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        print(f"无法初始化 TTK：{e}", file=sys.stderr)
+        return 1
+
     root.withdraw()
-    selected = args.report or filedialog.askopenfilename(
-        title="选择 evaluator 测试报告",
-        filetypes=(("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")),
-    )
+    selected = args.report or choose_report(root)
     if not selected:
         root.destroy()
         return 0
-    try:
-        print(f"[REPORT] 正在加载评测报告：{Path(selected).resolve()}", flush=True)
-        root.deiconify()
-        ReportViewer(root, Path(selected))
-        root.lift()
-        root.after(100, root.focus_force)
-        print("[REPORT] 只读界面加载完成。", flush=True)
-    except Exception as error:
-        print(f"[REPORT] 加载失败：{type(error).__name__}: {error}", file=sys.stderr, flush=True)
-        messagebox.showerror("无法打开评测报告", str(error), parent=root)
-        root.destroy()
-        return 1
+
+    selected = Path(selected).expanduser().resolve()
+    root.deiconify()
+    ViewerApp(root, selected)
+    root.lift()
+    root.after(100, root.focus_force)
     root.mainloop()
     return 0
 
