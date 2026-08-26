@@ -43,7 +43,11 @@ class AnnotationLogicTests(unittest.TestCase):
         self.assertEqual(make_result("click",[[1,2,30,40]]),{"action":"click","bbox":[[1,2,30,40]]})
         swipe={"start_coordinate":[10,20],"direction":"down","distance":"long"}
         self.assertEqual(make_result("swipe",swipe=swipe),{"action":"swipe",**swipe})
-        self.assertEqual(make_result("reject",parameters={"reason_type":"UNSUPPORTED_TARGET"}),{"action_id":"reject","reason_type":"UNSUPPORTED_TARGET"})
+        self.assertEqual(make_result("reject", parameters={}), {"action":"reject"})
+        with self.assertRaises(ValueError):
+            parse_result('{"action_id":"reject"}')
+        with self.assertRaises(ValueError):
+            parse_result('{"action":"reject","reason":"hidden"}')
         self.assertEqual(parse_result('{"action":"type","text":"测试"}')["text"],"测试")
         with self.assertRaises(ValueError):
             parse_result('{"action":"swipe","direction":"up"}')

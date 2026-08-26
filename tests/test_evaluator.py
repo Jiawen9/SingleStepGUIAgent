@@ -196,6 +196,19 @@ class EvaluationComparisonTests(unittest.TestCase):
             )[0]
         )
 
+    def test_legacy_reject_annotation_matches_parameterless_runtime_action(self):
+        expected = {
+            "action_id": "reject",
+            "reason_type": "TARGET_NOT_VISIBLE",
+        }
+        correct, reason = compare_action(
+            expected,
+            ActionSelection("reject", {}),
+            None,
+        )
+        self.assertTrue(correct)
+        self.assertEqual(reason, "Reject action matched.")
+
 
 class EvaluationWorkbookTests(unittest.TestCase):
     def test_detects_registered_app_after_unregistered_shell_package(self):

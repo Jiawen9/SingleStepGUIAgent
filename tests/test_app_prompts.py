@@ -34,7 +34,7 @@ class RuntimeAppPromptTests(unittest.TestCase):
     def test_unknown_package_uses_only_common_actions(self):
         prompt = build_system_prompt("com.example.other")
         self.assertIn('{"action":"click","coordinate":[x,y]}', prompt)
-        self.assertIn('"action_id":"reject"', prompt)
+        self.assertIn('"action":"reject"', prompt)
         self.assertNotIn("player_pause", prompt)
         self.assertNotIn("## 页面专用动作", prompt)
 

@@ -286,7 +286,6 @@ def is_search_page_loading(root) -> bool:
 def rejection_payload(*, stage: str, message: str) -> dict:
     return {
         "source": "atomic_tool",
-        "reason_type": "TARGET_NOT_VISIBLE",
         "stage": stage,
         "message": message,
     }

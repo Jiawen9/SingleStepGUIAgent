@@ -50,12 +50,8 @@ class ActionExecutor:
         if command.kind == "evaluation":
             raise RuntimeError("Evaluation-only commands cannot be executed on a device.")
         if command.kind == "reject":
-            reason_type = command.arguments["reason_type"]
-            message = {
-                "TARGET_NOT_VISIBLE": "当前截图中目标或必要状态不可见，无法执行。",
-                "UNSUPPORTED_TARGET": "用户提出的目标不受当前场景支持。",
-            }[reason_type]
-            return ExecutionResult(action.name, "rejected", message, {"dump_xml": 0.0, "adb_execution": 0.0}, {"dump_xml": [], "adb_execution": []}, {"source": "vla", "reason_type": reason_type})
+            message = "当前状态下无法可靠完成用户指令。"
+            return ExecutionResult(action.name, "rejected", message, {"dump_xml": 0.0, "adb_execution": 0.0}, {"dump_xml": [], "adb_execution": []}, {"source": "vla", "message": message})
 
         serial = snapshot.serial or self.adb.select_device()
         if command.kind == "adb":

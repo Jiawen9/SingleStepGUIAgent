@@ -285,16 +285,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ),
     ActionSpec(
         "reject",
-        "无法可靠执行时拒绝；目标不可见时 reason_type 输出 TARGET_NOT_VISIBLE；用户提出的目标不受当前场景支持时输出 UNSUPPORTED_TARGET。",
-        _object_parameters(
-            {
-                "reason_type": {
-                    "type": "string",
-                    "enum": ["TARGET_NOT_VISIBLE", "UNSUPPORTED_TARGET"],
-                }
-            },
-            ["reason_type"],
-        ),
+        "目标或必要状态不可见，或者没有一个动作能独立完成用户完整意图时拒绝。",
+        _EMPTY_PARAMETERS,
     ),
 )
 
@@ -366,13 +358,7 @@ def validate_action(
     elif selection.name.startswith("iqiyi_"):
         _require_exact_keys(arguments, set())
     elif selection.name == "reject":
-        _require_exact_keys(arguments, {"reason_type"})
-        allowed = {
-            "TARGET_NOT_VISIBLE",
-            "UNSUPPORTED_TARGET",
-        }
-        if arguments["reason_type"] not in allowed:
-            raise ValueError("Invalid reject reason_type.")
+        _require_exact_keys(arguments, set())
 
 
 def _require_exact_keys(arguments: dict[str, Any], expected: set[str]) -> None:

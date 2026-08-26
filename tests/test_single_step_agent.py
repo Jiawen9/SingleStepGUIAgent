@@ -220,21 +220,29 @@ class ApiResponseTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             parse_action_response(response)
 
-    def test_gateway_json_fallback_does_not_retry(self):
+    def test_parses_parameterless_reject(self):
         response = {
             "choices": [
                 {
                     "message": {
-                        "content": (
-                            '```json\n{"action_id":"reject",'
-                            '"reason_type":"TARGET_NOT_VISIBLE"}\n```'
-                        )
+                        "content": '```json\n{"action":"reject"}\n```'
                     }
                 }
             ]
         }
         action = parse_action_response(response)
-        self.assertEqual(action.name, "reject")
+        self.assertEqual(action, ActionSelection("reject", {}))
+
+    def test_rejects_legacy_or_parameterized_reject(self):
+        contents = (
+            '{"action_id":"reject","reason_type":"TARGET_NOT_VISIBLE"}',
+            '{"action":"reject","reason_type":"TARGET_NOT_VISIBLE"}',
+        )
+        for content in contents:
+            with self.subTest(content=content), self.assertRaises(ApiError):
+                parse_action_response(
+                    {"choices": [{"message": {"content": content}}]}
+                )
 
     def test_parses_directional_swipe_into_endpoint_coordinates(self):
         response = {
@@ -398,53 +406,34 @@ class ValidationTests(unittest.TestCase):
                     800,
                 )
 
-    def test_removed_reject_reasons_are_invalid(self):
-        for reason in ("NOT_APPLICABLE", "UNSUPPORTED_REQUEST"):
-            with self.subTest(reason=reason), self.assertRaises(ValueError):
-                validate_action(
-                    ActionSelection(
-                        "reject", {"reason_type": reason}
-                    ),
-                    self.specs,
-                    1200,
-                    800,
-                )
-
+    def test_reject_is_parameterless(self):
+        validate_action(ActionSelection("reject", {}), self.specs, 1200, 800)
+        with self.assertRaises(ValueError):
+            validate_action(
+                ActionSelection("reject", {"reason_type": "TARGET_NOT_VISIBLE"}),
+                self.specs,
+                1200,
+                800,
+            )
         reject = next(spec for spec in self.specs if spec.name == "reject")
-        enum = reject.parameters["properties"]["reason_type"]["enum"]
-        self.assertEqual(enum, ["TARGET_NOT_VISIBLE", "UNSUPPORTED_TARGET"])
-        self.assertEqual(reject.parameters["required"], ["reason_type"])
-        self.assertNotIn("message", reject.parameters["properties"])
-        self.assertNotIn(
-            "description",
-            reject.parameters["properties"]["reason_type"],
-        )
-        self.assertIn(
-            "reason_type 输出 TARGET_NOT_VISIBLE",
-            reject.description,
-        )
-        self.assertIn(
-            "用户提出的目标不受当前场景支持时输出 UNSUPPORTED_TARGET",
-            reject.description,
-        )
+        self.assertEqual(reject.parameters["properties"], {})
+        self.assertEqual(reject.parameters["required"], [])
 
     def test_reject_message_is_generated_locally(self):
         executor = ActionExecutor(SimpleNamespace(), Path.cwd())
         snapshot = ScreenSnapshot(b"", 1200, 800, None)
         result = executor.execute(
-            ActionSelection(
-                "reject", {"reason_type": "UNSUPPORTED_TARGET"}
-            ),
+            ActionSelection("reject", {}),
             snapshot,
         )
         self.assertEqual(result.status, "rejected")
         self.assertEqual(
             result.message,
-            "用户提出的目标不受当前场景支持。",
+            "当前状态下无法可靠完成用户指令。",
         )
         self.assertEqual(
             result.rejection,
-            {"source": "vla", "reason_type": "UNSUPPORTED_TARGET"},
+            {"source": "vla", "message": "当前状态下无法可靠完成用户指令。"},
         )
 
     def test_seek_to_start_is_parameterless_and_preserves_play_state(self):
@@ -729,8 +718,7 @@ class VlaImageInputTests(unittest.TestCase):
         self.assertNotIn('"parameters"', system_prompt)
         self.assertNotIn('"additionalProperties"', system_prompt)
         for spec in specs:
-            field = "action_id" if spec.name == "reject" else "action"
-            self.assertIn(f'"{field}":"{spec.name}"', system_prompt)
+            self.assertIn(f'"action":"{spec.name}"', system_prompt)
         self.assertEqual(
             captured["messages"][1]["content"][1]["text"],
             build_user_prompt("搜索海绵宝宝"),
@@ -770,15 +758,22 @@ class VlaImageInputTests(unittest.TestCase):
         self.assertNotIn("爱奇艺视频", compact)
         self.assertIn("## 拒绝动作", compact)
         self.assertIn(
-            '{"action_id":"reject","reason_type":"拒绝类型"}:',
+            '{"action":"reject"}:',
             compact,
         )
         self.assertNotIn("message:string", compact)
-        self.assertNotIn("# Reject reason_type", compact)
+        self.assertNotIn("reason_type", compact)
         reject_definition = compact[compact.index("## 拒绝动作") :]
-        self.assertIn("使用 TARGET_NOT_VISIBLE", reject_definition)
-        self.assertIn("使用 UNSUPPORTED_TARGET", reject_definition)
-        self.assertIn("用户提出的目标不受当前场景支持", reject_definition)
+        self.assertIn("第一种必须拒绝的情况", reject_definition)
+        self.assertIn("第二种必须拒绝的情况", reject_definition)
+        self.assertIn("能够独立完成用户的完整最终意图", compact)
+        self.assertIn("禁止把用户的完整任务降级成一个看似有帮助的局部步骤", compact)
+        self.assertIn("`player_search` 只完成搜索，不等于播放搜索结果", compact)
+        self.assertIn("打开爱奇艺播放庆余年2", compact)
+        self.assertIn(
+            '{"action":"reject"}',
+            compact,
+        )
         self.assertIn("坐标以当前输入图为准", compact)
         self.assertNotIn("1000×1000", compact)
         self.assertNotIn("0 到 1000", compact)
@@ -786,8 +781,7 @@ class VlaImageInputTests(unittest.TestCase):
         self.assertNotIn("x1?:number", compact)
         self.assertIn('{"action":"player_pause"}', compact)
         for spec in specs:
-            field = "action_id" if spec.name == "reject" else "action"
-            self.assertIn(f'"{field}":"{spec.name}"', compact)
+            self.assertIn(f'"action":"{spec.name}"', compact)
 
 
 class XmlHierarchyTests(unittest.TestCase):
@@ -1907,7 +1901,6 @@ class ArtifactTests(unittest.TestCase):
             )
             rejection = {
                 "source": "atomic_tool",
-                "reason_type": "TARGET_NOT_VISIBLE",
                 "stage": "quality_control",
                 "requested_quality": "720p",
                 "message": "当前播放界面没有清晰度控件。",
@@ -2229,7 +2222,6 @@ class TimingAndConsoleTests(unittest.TestCase):
         )
         rejection = {
             "source": "atomic_tool",
-            "reason_type": "TARGET_NOT_VISIBLE",
             "stage": "quality_control",
             "requested_quality": "720p",
             "message": "清晰度入口不可见",
@@ -2393,11 +2385,11 @@ class TimingAndConsoleTests(unittest.TestCase):
         )
         self.assertEqual(label, '{"action":"player_pause"}')
         reject_label = _action_label(
-            ActionSelection("reject", {"reason_type": "TARGET_NOT_VISIBLE"})
+            ActionSelection("reject", {})
         )
         self.assertEqual(
             reject_label,
-            '{"action_id":"reject","reason_type":"TARGET_NOT_VISIBLE"}',
+            '{"action":"reject"}',
         )
 
     def test_atomic_timing_line_is_removed_from_visible_output(self):
@@ -2421,7 +2413,6 @@ class TimingAndConsoleTests(unittest.TestCase):
             'Quality control missing.\n__GUI_AGENT_RESULT__={"status":"rejected",'
             '"message":"清晰度入口不可见",'
             '"rejection":{"source":"atomic_tool",'
-            '"reason_type":"TARGET_NOT_VISIBLE",'
             '"stage":"quality_control"}}\n'
         )
         self.assertEqual(visible.strip(), "Quality control missing.")

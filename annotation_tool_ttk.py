@@ -70,9 +70,9 @@ def swipe_details(start: tuple[int,int], end: tuple[int,int], width: int, height
 def parse_result(raw: str) -> dict[str,Any] | None:
     if not raw.strip(): return None
     value = json.loads(raw)
-    if not isinstance(value, dict) or not isinstance(value.get("action", value.get("action_id")), str):
-        raise ValueError("结果输出必须是含 action 或 action_id 的 JSON 对象。")
-    action = value.get("action", value.get("action_id"))
+    if not isinstance(value, dict) or not isinstance(value.get("action"), str):
+        raise ValueError("结果输出必须是含 action 的 JSON 对象。")
+    action = value["action"]
     if action not in {spec.name for spec in ACTION_SPECS}:
         raise ValueError(f"未知动作：{action}")
     if action == "click":
@@ -93,6 +93,8 @@ def parse_result(raw: str) -> dict[str,Any] | None:
             raise ValueError("swipe 的 direction 无效。")
         if value.get("distance") not in {"short", "medium", "long"}:
             raise ValueError("swipe 的 distance 无效。")
+    if action == "reject" and set(value) != {"action"}:
+        raise ValueError("reject 动作不能携带参数。")
     return value
 
 def make_result(action: str, boxes=None, swipe=None, parameters=None) -> dict[str,Any]:
@@ -102,7 +104,7 @@ def make_result(action: str, boxes=None, swipe=None, parameters=None) -> dict[st
     if action == "swipe":
         if not swipe: raise ValueError("请在图片上拖拽标注滑动动作。")
         return {"action":"swipe", **swipe}
-    if action == "reject": return {"action_id":"reject", **(parameters or {})}
+    if action == "reject": return {"action":"reject"}
     return {"action":action, **(parameters or {})}
 
 def select_task_sheet(workbook):
