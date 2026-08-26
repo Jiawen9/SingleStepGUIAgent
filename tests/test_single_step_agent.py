@@ -770,6 +770,10 @@ class VlaImageInputTests(unittest.TestCase):
         self.assertIn("禁止把用户的完整任务降级成一个看似有帮助的局部步骤", compact)
         self.assertIn("`player_search` 只完成搜索，不等于播放搜索结果", compact)
         self.assertIn("打开爱奇艺播放庆余年2", compact)
+        self.assertIn("## 播放进度操作规则", compact)
+        self.assertIn("影视播放场景中的进度类任务，禁止使用普通 `click`", compact)
+        self.assertIn("音乐或音频播放场景中的进度条任务", compact)
+        self.assertIn("选择 `click` 定位、`swipe` 拖动", compact)
         self.assertIn(
             '{"action":"reject"}',
             compact,
